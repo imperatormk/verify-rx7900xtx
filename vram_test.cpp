@@ -1,0 +1,867 @@
+// VRAM test for the RX 7900 XTX.
+//
+// Works when host RAM is smaller than VRAM. The host only holds a staging
+// chunk. Each 8-byte word is a function of the seed and the word index, so the
+// expected bytes can be rebuilt on readback and compared directly.
+
+#include <hip/hip_runtime_api.h>
+
+#include <sys/random.h>
+#include <unistd.h>
+
+#include <dirent.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr size_t kAlign = 2ull << 20;             // 2 MiB
+constexpr size_t kPreferBlock = 1ull << 30;       // 1 GiB
+constexpr size_t kMinBlock = 2ull << 20;          // 2 MiB
+constexpr size_t kTargetLeftover = 64ull << 20;   // keep allocating down to this
+constexpr size_t kMaxLeftover = 256ull << 20;     // fail if more than this remains free
+constexpr size_t kMaxChunk = 1ull << 30;          // 1 GiB
+constexpr int kDefaultRounds = 10;
+constexpr size_t kDefaultChunkMiB = 256;
+
+struct Block {
+    void* ptr = nullptr;
+    size_t bytes = 0;
+    uint64_t base = 0;
+};
+
+struct Mismatch {
+    bool found = false;
+    uint64_t offset = 0;
+    uint64_t expected = 0;
+    uint64_t actual = 0;
+};
+
+struct CheckHit {
+    bool hit = false;
+    size_t index = 0;
+    uint64_t expected = 0;
+    uint64_t actual = 0;
+};
+
+struct SysfsVram {
+    bool ok = false;
+    uint64_t used = 0;
+    uint64_t total = 0;
+};
+
+// SplitMix64 finalizer. The word depends only on the seed and the word index.
+uint64_t pattern_word(uint64_t seed, uint64_t word_index) {
+    uint64_t z = seed + word_index;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+std::string format_bytes(uint64_t n) {
+    char buf[64];
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    const double mib = 1024.0 * 1024.0;
+    if (n >= static_cast<uint64_t>(gib)) {
+        std::snprintf(buf, sizeof buf, "%.2f GiB", static_cast<double>(n) / gib);
+    } else {
+        std::snprintf(buf, sizeof buf, "%.2f MiB", static_cast<double>(n) / mib);
+    }
+    return buf;
+}
+
+std::string lower_compact(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c == ' ' || c == '-' || c == '_') {
+            continue;
+        }
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+bool iequals(const std::string& a, const std::string& b) {
+    return lower_compact(a) == lower_compact(b);
+}
+
+bool is_card_node(const std::string& name) {
+    if (name.size() < 5 || name.compare(0, 4, "card") != 0) {
+        return false;
+    }
+    for (size_t i = 4; i < name.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(name[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parse_u64(const char* s, uint64_t* out) {
+    if (s == nullptr || *s == '\0') {
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        return false;
+    }
+    *out = static_cast<uint64_t>(v);
+    return true;
+}
+
+bool read_u64_file(const std::string& path, uint64_t* out) {
+    std::ifstream in(path);
+    if (!in) {
+        return false;
+    }
+    uint64_t v = 0;
+    in >> v;
+    if (!in) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+bool read_meminfo_kb(const char* key, uint64_t* kb) {
+    std::ifstream in("/proc/meminfo");
+    if (!in) {
+        return false;
+    }
+    std::string k;
+    uint64_t v = 0;
+    while (in >> k >> v) {
+        if (k == key) {
+            *kb = v;
+            return true;
+        }
+        in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    return false;
+}
+
+void hip_clear_error() {
+    (void)hipGetLastError();
+}
+
+bool hip_ok(hipError_t err, const char* what) {
+    if (err == hipSuccess) {
+        return true;
+    }
+    std::fprintf(stderr, "FAIL: %s: %s\n", what, hipGetErrorString(err));
+    hip_clear_error();
+    return false;
+}
+
+uint64_t random_seed() {
+    uint64_t seed = 0;
+    ssize_t n = getrandom(&seed, sizeof seed, 0);
+    if (n == static_cast<ssize_t>(sizeof seed)) {
+        return seed;
+    }
+    std::ifstream in("/dev/urandom", std::ios::binary);
+    in.read(reinterpret_cast<char*>(&seed), sizeof seed);
+    if (!in) {
+        std::fprintf(stderr, "FAIL: could not read a random seed\n");
+        std::exit(2);
+    }
+    return seed;
+}
+
+unsigned thread_count(size_t words) {
+    unsigned n = std::thread::hardware_concurrency();
+    if (n == 0) {
+        n = 1;
+    }
+    if (n > 12) {
+        n = 12;
+    }
+    if (words < 64 * 1024 || n > words) {
+        return 1;
+    }
+    return n;
+}
+
+void parallel_fill(uint64_t* data, size_t words, uint64_t seed, uint64_t base_word) {
+    const unsigned n = thread_count(words);
+    if (n == 1) {
+        for (size_t i = 0; i < words; ++i) {
+            data[i] = pattern_word(seed, base_word + i);
+        }
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    const size_t span = (words + n - 1) / n;
+    for (unsigned t = 0; t < n; ++t) {
+        const size_t begin = static_cast<size_t>(t) * span;
+        if (begin >= words) {
+            break;
+        }
+        const size_t end = std::min(words, begin + span);
+        threads.emplace_back([data, begin, end, seed, base_word]() {
+            for (size_t i = begin; i < end; ++i) {
+                data[i] = pattern_word(seed, base_word + i);
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+}
+
+std::optional<CheckHit> parallel_check(uint64_t* data, size_t words, uint64_t seed, uint64_t base_word) {
+    const unsigned n = thread_count(words);
+    std::vector<CheckHit> hits(n);
+    if (n == 1) {
+        for (size_t i = 0; i < words; ++i) {
+            const uint64_t expected = pattern_word(seed, base_word + i);
+            const uint64_t actual = data[i];
+            if (expected != actual) {
+                CheckHit hit;
+                hit.hit = true;
+                hit.index = i;
+                hit.expected = expected;
+                hit.actual = actual;
+                return hit;
+            }
+        }
+        return std::nullopt;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    const size_t span = (words + n - 1) / n;
+    for (unsigned t = 0; t < n; ++t) {
+        const size_t begin = static_cast<size_t>(t) * span;
+        if (begin >= words) {
+            break;
+        }
+        const size_t end = std::min(words, begin + span);
+        threads.emplace_back([data, begin, end, seed, base_word, hit = &hits[t]]() {
+            for (size_t i = begin; i < end; ++i) {
+                const uint64_t expected = pattern_word(seed, base_word + i);
+                const uint64_t actual = data[i];
+                if (expected != actual) {
+                    hit->hit = true;
+                    hit->index = i;
+                    hit->expected = expected;
+                    hit->actual = actual;
+                    return;
+                }
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+    std::optional<CheckHit> best;
+    for (const CheckHit& hit : hits) {
+        if (!hit.hit) {
+            continue;
+        }
+        if (!best || hit.index < best->index) {
+            best = hit;
+        }
+    }
+    return best;
+}
+
+bool is_rx7900xtx(const hipDeviceProp_t& prop) {
+    return lower_compact(prop.name).find("7900xtx") != std::string::npos;
+}
+
+int find_device() {
+    int count = 0;
+    if (!hip_ok(hipGetDeviceCount(&count), "hipGetDeviceCount")) {
+        return -1;
+    }
+    if (count < 1) {
+        std::fprintf(stderr, "FAIL: no HIP device\n");
+        return -1;
+    }
+    int found = -1;
+    for (int i = 0; i < count; ++i) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, i) != hipSuccess) {
+            hip_clear_error();
+            continue;
+        }
+        std::printf("found: gpu %d  %s  (%s)  VRAM %s\n",
+                    i,
+                    prop.name,
+                    prop.gcnArchName,
+                    format_bytes(prop.totalGlobalMem).c_str());
+        if (found < 0 && is_rx7900xtx(prop)) {
+            found = i;
+        }
+    }
+    if (found < 0) {
+        std::fprintf(stderr, "FAIL: RX 7900 XTX not found\n");
+    }
+    return found;
+}
+
+std::string pci_bus_id(int device) {
+    char bus[64] = {};
+    if (hipDeviceGetPCIBusId(bus, static_cast<int>(sizeof bus), device) != hipSuccess) {
+        hip_clear_error();
+        return {};
+    }
+    return bus;
+}
+
+std::string sysfs_device_path(const std::string& pci) {
+    if (pci.empty()) {
+        return {};
+    }
+    DIR* dir = opendir("/sys/class/drm");
+    if (dir == nullptr) {
+        return {};
+    }
+    std::string found;
+    while (dirent* de = readdir(dir)) {
+        if (!is_card_node(de->d_name)) {
+            continue;
+        }
+        const std::string uevent_path = std::string("/sys/class/drm/") + de->d_name + "/device/uevent";
+        std::ifstream in(uevent_path);
+        std::string line;
+        while (std::getline(in, line)) {
+            const std::string key = "PCI_SLOT_NAME=";
+            if (line.compare(0, key.size(), key) == 0 && iequals(line.substr(key.size()), pci)) {
+                found = std::string("/sys/class/drm/") + de->d_name + "/device";
+                break;
+            }
+        }
+        if (!found.empty()) {
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+bool read_sysfs_vram(const std::string& device_path, SysfsVram* out) {
+    out->ok = false;
+    if (device_path.empty()) {
+        return false;
+    }
+    uint64_t used = 0;
+    uint64_t total = 0;
+    if (!read_u64_file(device_path + "/mem_info_vram_used", &used) ||
+        !read_u64_file(device_path + "/mem_info_vram_total", &total)) {
+        return false;
+    }
+    out->ok = true;
+    out->used = used;
+    out->total = total;
+    return true;
+}
+
+void* try_hip_malloc(size_t bytes) {
+    void* ptr = nullptr;
+    hipError_t err = hipMalloc(&ptr, bytes);
+    if (err != hipSuccess) {
+        hip_clear_error();
+        return nullptr;
+    }
+    return ptr;
+}
+
+// Try to allocate the request, shrinking by 64 MiB after each failure.
+bool alloc_with_shrink(size_t want, void** ptr, size_t* got) {
+    if (want < kMinBlock) {
+        return false;
+    }
+    want &= ~(kAlign - 1);
+    while (want >= kMinBlock) {
+        void* p = try_hip_malloc(want);
+        if (p != nullptr) {
+            *ptr = p;
+            *got = want;
+            return true;
+        }
+        if (want <= (64ull << 20)) {
+            break;
+        }
+        want = (want - (64ull << 20)) & ~(kAlign - 1);
+    }
+    return false;
+}
+
+bool allocate_vram(std::vector<Block>* blocks, size_t* allocated, size_t* free_after, size_t* total) {
+    uint64_t base = 0;
+    size_t prev_free = std::numeric_limits<size_t>::max();
+    int stalls = 0;
+    for (int guard = 0; guard < 100000; ++guard) {
+        size_t free_b = 0;
+        size_t total_b = 0;
+        if (!hip_ok(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo")) {
+            return false;
+        }
+        *total = total_b;
+        *free_after = free_b;
+        *allocated = static_cast<size_t>(base);
+        if (free_b <= kTargetLeftover) {
+            return true;
+        }
+        if (free_b >= prev_free) {
+            if (++stalls >= 2) {
+                return free_b <= kMaxLeftover;
+            }
+        } else {
+            stalls = 0;
+        }
+        prev_free = free_b;
+
+        size_t aligned = free_b & ~(kAlign - 1);
+        if (aligned < kMinBlock) {
+            return free_b <= kMaxLeftover;
+        }
+        size_t want = std::min(aligned, kPreferBlock);
+        void* ptr = nullptr;
+        size_t got = 0;
+        if (!alloc_with_shrink(want, &ptr, &got)) {
+            return free_b <= kMaxLeftover;
+        }
+        blocks->push_back(Block{ptr, got, base});
+        base += got;
+    }
+    return false;
+}
+
+void free_blocks(std::vector<Block>* blocks) {
+    for (Block& block : *blocks) {
+        if (block.ptr != nullptr) {
+            (void)hipFree(block.ptr);
+            block.ptr = nullptr;
+        }
+    }
+    blocks->clear();
+    hip_clear_error();
+}
+
+void print_progress(const char* phase, uint64_t done, uint64_t total) {
+    static const char* active = nullptr;
+    static uint64_t last = 0;
+    if (active != phase) {
+        active = phase;
+        last = 0;
+    }
+    const bool tty = ::isatty(STDOUT_FILENO) == 1;
+    const uint64_t step = 4ull << 30;
+    const bool boundary = (done / step) != (last / step);
+    if (tty) {
+        std::printf("\r  %s  %s / %s", phase, format_bytes(done).c_str(), format_bytes(total).c_str());
+        if (done >= total) {
+            std::printf("\n");
+        }
+        std::fflush(stdout);
+    } else if (done == 0 || done >= total || boundary) {
+        std::printf("  %s  %s / %s\n", phase, format_bytes(done).c_str(), format_bytes(total).c_str());
+    }
+    last = done;
+}
+
+bool move_chunk(bool to_device, void* device_at, uint8_t* host, size_t nbytes) {
+    hipError_t err = to_device
+                         ? hipMemcpy(device_at, host, nbytes, hipMemcpyHostToDevice)
+                         : hipMemcpy(host, device_at, nbytes, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        std::fprintf(stderr,
+                     "\nFAIL: hipMemcpy (%s, %s): %s\n",
+                     to_device ? "H2D" : "D2H",
+                     format_bytes(nbytes).c_str(),
+                     hipGetErrorString(err));
+        hip_clear_error();
+        return false;
+    }
+    return true;
+}
+
+bool transfer_and_check(const std::vector<Block>& blocks,
+                        uint64_t seed,
+                        uint8_t* host,
+                        size_t chunk,
+                        bool to_device,
+                        Mismatch* mismatch) {
+    uint64_t total = 0;
+    for (const Block& block : blocks) {
+        total += block.bytes;
+    }
+    uint64_t done = 0;
+    const char* phase = to_device ? "host -> VRAM" : "VRAM -> host";
+    print_progress(phase, 0, total);
+    for (const Block& block : blocks) {
+        auto* words = reinterpret_cast<uint64_t*>(host);
+        for (size_t off = 0; off < block.bytes; off += chunk) {
+            const size_t nbytes = std::min(chunk, block.bytes - off);
+            const size_t nwords = nbytes / sizeof(uint64_t);
+            const uint64_t base_word = (block.base + off) / sizeof(uint64_t);
+            auto* device_at = static_cast<uint8_t*>(block.ptr) + off;
+            if (to_device) {
+                parallel_fill(words, nwords, seed, base_word);
+                if (!move_chunk(true, device_at, host, nbytes)) {
+                    return false;
+                }
+            } else {
+                std::memset(host, 0, nbytes);
+                if (!move_chunk(false, device_at, host, nbytes)) {
+                    return false;
+                }
+                if (auto hit = parallel_check(words, nwords, seed, base_word)) {
+                    mismatch->found = true;
+                    mismatch->offset = block.base + static_cast<uint64_t>(off) +
+                                       static_cast<uint64_t>(hit->index) * sizeof(uint64_t);
+                    mismatch->expected = hit->expected;
+                    mismatch->actual = hit->actual;
+                    std::printf("\n");
+                    return false;
+                }
+            }
+            done += nbytes;
+            print_progress(phase, done, total);
+        }
+    }
+    return true;
+}
+
+struct Staging {
+    uint8_t* ptr = nullptr;
+    bool pinned = false;
+
+    ~Staging() { reset(); }
+
+    bool alloc(size_t bytes) {
+        void* raw = nullptr;
+        hipError_t err = hipHostMalloc(&raw, bytes, hipHostMallocDefault);
+        if (err == hipSuccess) {
+            ptr = static_cast<uint8_t*>(raw);
+            pinned = true;
+            return true;
+        }
+        hip_clear_error();
+        raw = std::aligned_alloc(64, bytes);
+        if (raw == nullptr) {
+            std::fprintf(stderr, "FAIL: could not allocate the staging buffer (%s)\n", format_bytes(bytes).c_str());
+            return false;
+        }
+        ptr = static_cast<uint8_t*>(raw);
+        pinned = false;
+        return true;
+    }
+
+    void reset() {
+        if (ptr == nullptr) {
+            return;
+        }
+        if (pinned) {
+            (void)hipHostFree(ptr);
+            hip_clear_error();
+        } else {
+            std::free(ptr);
+        }
+        ptr = nullptr;
+        pinned = false;
+    }
+};
+
+struct RoundCleanup {
+    int device = 0;
+    std::vector<Block>* blocks = nullptr;
+    Staging* staging = nullptr;
+    bool active = true;
+
+    ~RoundCleanup() {
+        if (!active) {
+            return;
+        }
+        if (staging != nullptr) {
+            staging->reset();
+        }
+        if (blocks != nullptr) {
+            free_blocks(blocks);
+        }
+        (void)hipSetDevice(device);
+        (void)hipDeviceSynchronize();
+        // Drop the caching allocator so it does not keep holding VRAM.
+        (void)hipDeviceReset();
+    }
+};
+
+bool within_leftover(uint64_t gap) {
+    return gap <= kMaxLeftover;
+}
+
+bool run_round(int round, int rounds, int device, size_t chunk, const std::string& sysfs_path) {
+    std::printf("\n--- round %d/%d ---\n", round, rounds);
+    std::fflush(stdout);
+
+    if (!hip_ok(hipSetDevice(device), "hipSetDevice")) {
+        return false;
+    }
+
+    const uint64_t seed = random_seed();
+    std::printf("seed: 0x%016llx\n", static_cast<unsigned long long>(seed));
+
+    size_t free_before = 0;
+    size_t total = 0;
+    if (!hip_ok(hipMemGetInfo(&free_before, &total), "hipMemGetInfo")) {
+        return false;
+    }
+    SysfsVram sysfs_before{};
+    read_sysfs_vram(sysfs_path, &sysfs_before);
+    std::printf("before alloc  HIP free %s / total %s\n",
+                format_bytes(free_before).c_str(),
+                format_bytes(total).c_str());
+    if (sysfs_before.ok) {
+        std::printf("before alloc  sysfs used %s / total %s\n",
+                    format_bytes(sysfs_before.used).c_str(),
+                    format_bytes(sysfs_before.total).c_str());
+    }
+
+    std::vector<Block> blocks;
+    Staging staging;
+    RoundCleanup cleanup{device, &blocks, &staging, true};
+
+    std::printf("allocating VRAM...\n");
+    std::fflush(stdout);
+    size_t allocated = 0;
+    size_t free_after = 0;
+    size_t total_after = 0;
+    if (!allocate_vram(&blocks, &allocated, &free_after, &total_after)) {
+        std::fprintf(stderr,
+                     "FAIL: round %d could not allocate the free VRAM (allocated %s, free %s)\n",
+                     round,
+                     format_bytes(allocated).c_str(),
+                     format_bytes(free_after).c_str());
+        return false;
+    }
+
+    const uint64_t unallocated =
+        free_before > allocated + free_after ? free_before - allocated - free_after : 0;
+    std::printf("allocated %s  (%zu blocks), free after alloc %s\n",
+                format_bytes(allocated).c_str(),
+                blocks.size(),
+                format_bytes(free_after).c_str());
+
+    if (!within_leftover(free_after) || !within_leftover(unallocated) || allocated == 0) {
+        std::fprintf(stderr,
+                     "FAIL: round %d did not fill VRAM (free %s, unaccounted %s, limit %s)\n",
+                     round,
+                     format_bytes(free_after).c_str(),
+                     format_bytes(unallocated).c_str(),
+                     format_bytes(kMaxLeftover).c_str());
+        return false;
+    }
+
+    SysfsVram sysfs_after{};
+    if (!read_sysfs_vram(sysfs_path, &sysfs_after)) {
+        std::fprintf(stderr, "FAIL: round %d could not read sysfs VRAM usage\n", round);
+        return false;
+    }
+    // The runtime may reuse VRAM that sysfs still counts as used.
+    // Judge fullness from the used amount after allocation, not from the delta.
+    const uint64_t sysfs_free =
+        sysfs_after.total > sysfs_after.used ? sysfs_after.total - sysfs_after.used : 0;
+    const bool covers_alloc = sysfs_after.used + kMaxLeftover >= allocated;
+    std::printf("after alloc  sysfs used %s / total %s (free %s)\n",
+                format_bytes(sysfs_after.used).c_str(),
+                format_bytes(sysfs_after.total).c_str(),
+                format_bytes(sysfs_free).c_str());
+    if (!within_leftover(sysfs_free) || !covers_alloc) {
+        std::fprintf(stderr,
+                     "FAIL: round %d sysfs usage (%s / %s) does not show VRAM exhausted\n",
+                     round,
+                     format_bytes(sysfs_after.used).c_str(),
+                     format_bytes(sysfs_after.total).c_str());
+        return false;
+    }
+
+    if (!staging.alloc(chunk)) {
+        return false;
+    }
+    std::printf("staging: %s (%s)\n",
+                format_bytes(chunk).c_str(),
+                staging.pinned ? "pinned" : "pageable");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    Mismatch mismatch;
+    if (!transfer_and_check(blocks, seed, staging.ptr, chunk, true, &mismatch)) {
+        std::fprintf(stderr, "FAIL: round %d host-to-VRAM copy failed\n", round);
+        return false;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize")) {
+        return false;
+    }
+    if (!transfer_and_check(blocks, seed, staging.ptr, chunk, false, &mismatch)) {
+        if (mismatch.found) {
+            std::fprintf(stderr,
+                         "FAIL: round %d mismatch at offset %llu expected 0x%016llx actual 0x%016llx\n",
+                         round,
+                         static_cast<unsigned long long>(mismatch.offset),
+                         static_cast<unsigned long long>(mismatch.expected),
+                         static_cast<unsigned long long>(mismatch.actual));
+        } else {
+            std::fprintf(stderr, "FAIL: round %d VRAM-to-host copy failed\n", round);
+        }
+        return false;
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+
+    const double h2d = std::chrono::duration<double>(t1 - t0).count();
+    const double d2h = std::chrono::duration<double>(t2 - t1).count();
+    const double gib = static_cast<double>(allocated) / (1024.0 * 1024.0 * 1024.0);
+    std::printf("round %d: PASS  (H2D %.1f s, %.2f GiB/s / D2H check %.1f s, %.2f GiB/s)\n",
+                round,
+                h2d,
+                h2d > 0 ? gib / h2d : 0,
+                d2h,
+                d2h > 0 ? gib / d2h : 0);
+    return true;
+}
+
+size_t choose_chunk(size_t requested) {
+    uint64_t available_kb = 0;
+    if (!read_meminfo_kb("MemAvailable:", &available_kb)) {
+        std::fprintf(stderr, "FAIL: could not read MemAvailable\n");
+        std::exit(2);
+    }
+    const uint64_t available = available_kb * 1024ull;
+    uint64_t limit = available / 4;
+    limit &= ~((1ull << 20) - 1);
+    if (limit > kMaxChunk) {
+        limit = kMaxChunk;
+    }
+    size_t chunk = requested;
+    if (static_cast<uint64_t>(chunk) > limit) {
+        std::printf("shrinking chunk from %s to %s (MemAvailable %s)\n",
+                    format_bytes(chunk).c_str(),
+                    format_bytes(limit).c_str(),
+                    format_bytes(available).c_str());
+        chunk = static_cast<size_t>(limit);
+    }
+    if (chunk < (1ull << 20)) {
+        std::fprintf(stderr, "FAIL: not enough host memory for the staging buffer\n");
+        std::exit(2);
+    }
+    return chunk;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
+    int rounds = kDefaultRounds;
+    size_t chunk_mib = kDefaultChunkMiB;
+    if (argc >= 2) {
+        uint64_t v = 0;
+        if (!parse_u64(argv[1], &v) || v < 1 || v > 10000) {
+            std::fprintf(stderr, "usage: %s [rounds] [chunk_mib]\n", argv[0]);
+            return 2;
+        }
+        rounds = static_cast<int>(v);
+    }
+    if (argc >= 3) {
+        uint64_t v = 0;
+        if (!parse_u64(argv[2], &v) || v < 1 || v > 1024 * 1024) {
+            std::fprintf(stderr, "usage: %s [rounds] [chunk_mib]\n", argv[0]);
+            return 2;
+        }
+        chunk_mib = static_cast<size_t>(v);
+    }
+    if (argc > 3) {
+        std::fprintf(stderr, "usage: %s [rounds] [chunk_mib]\n", argv[0]);
+        return 2;
+    }
+
+    std::printf("=== VRAM test (RX 7900 XTX) ===\n");
+    const int device = find_device();
+    if (device < 0) {
+        return 2;
+    }
+    if (!hip_ok(hipSetDevice(device), "hipSetDevice")) {
+        return 2;
+    }
+
+    hipDeviceProp_t prop{};
+    if (!hip_ok(hipGetDeviceProperties(&prop, device), "hipGetDeviceProperties")) {
+        return 2;
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (!hip_ok(hipMemGetInfo(&free_bytes, &total_bytes), "hipMemGetInfo")) {
+        return 2;
+    }
+
+    const std::string pci = pci_bus_id(device);
+    const std::string sysfs_path = sysfs_device_path(pci);
+    SysfsVram sysfs{};
+    read_sysfs_vram(sysfs_path, &sysfs);
+
+    uint64_t mem_total_kb = 0;
+    uint64_t mem_avail_kb = 0;
+    read_meminfo_kb("MemTotal:", &mem_total_kb);
+    read_meminfo_kb("MemAvailable:", &mem_avail_kb);
+    const uint64_t mem_total = mem_total_kb * 1024ull;
+    const uint64_t mem_avail = mem_avail_kb * 1024ull;
+
+    std::printf("device: gpu %d  %s  (%s)  PCI %s\n", device, prop.name, prop.gcnArchName, pci.c_str());
+    std::printf("VRAM total: %s (%llu bytes)\n",
+                format_bytes(prop.totalGlobalMem).c_str(),
+                static_cast<unsigned long long>(prop.totalGlobalMem));
+    std::printf("VRAM free: %s / HIP total %s\n",
+                format_bytes(free_bytes).c_str(),
+                format_bytes(total_bytes).c_str());
+    if (sysfs.ok) {
+        std::printf("sysfs VRAM: used %s / total %s\n",
+                    format_bytes(sysfs.used).c_str(),
+                    format_bytes(sysfs.total).c_str());
+    }
+    std::printf("host memory: total %s / available %s\n",
+                format_bytes(mem_total).c_str(),
+                format_bytes(mem_avail).c_str());
+    if (mem_total > 0 && mem_total < prop.totalGlobalMem) {
+        std::printf("host memory is smaller than VRAM, so the test copies in chunks.\n");
+    }
+
+    const size_t chunk = choose_chunk(chunk_mib << 20);
+    std::printf("rounds: %d  chunk: %s  max leftover: %s\n",
+                rounds,
+                format_bytes(chunk).c_str(),
+                format_bytes(kMaxLeftover).c_str());
+    std::fflush(stdout);
+
+    int failed = 0;
+    for (int round = 1; round <= rounds; ++round) {
+        if (!run_round(round, rounds, device, chunk, sysfs_path)) {
+            ++failed;
+        }
+    }
+
+    std::printf("\nresult: %d/%d passed", rounds - failed, rounds);
+    if (failed == 0) {
+        std::printf("\n");
+        return 0;
+    }
+    std::printf(", %d failed\n", failed);
+    return 1;
+}
