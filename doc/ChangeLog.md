@@ -4,6 +4,12 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 15:13:20 — Write the result log as JSON
+
+- The result file is now `vram-test-YYYYMMDD-HHMMSS.json`
+- Each round is an object. Mismatches include numeric offsets and hex expected and actual values
+- `README.md` and `doc/design.md` describe the JSON object
+
 ## 2026-10-21 14:52:10 — Write a compact result log
 
 - Each run writes `vram-test-YYYYMMDD-HHMMSS.log` with the host, GPU, one line per round, and the final result

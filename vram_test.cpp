@@ -21,7 +21,6 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -769,12 +768,87 @@ struct RoundRecord {
     double d2d_rate = 0;
     double check_s = 0;
     double check_rate = 0;
+    bool have_mismatch = false;
+    bool have_source_offset = false;
+    uint64_t mismatch_offset = 0;
+    uint64_t source_offset = 0;
+    uint64_t expected = 0;
+    uint64_t actual = 0;
     std::string fail;
 };
+
+std::string json_escape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+void json_string(FILE* fp, const std::string& text) {
+    const std::string escaped = json_escape(text);
+    std::fputc('"', fp);
+    std::fwrite(escaped.data(), 1, escaped.size(), fp);
+    std::fputc('"', fp);
+}
 
 struct Report {
     FILE* fp = nullptr;
     std::string path;
+    std::string time;
+    std::string host;
+    std::string kernel;
+    std::string hip;
+    bool have_device = false;
+    std::string device;
+    std::string arch;
+    std::string pci;
+    bool have_vram_total = false;
+    uint64_t vram_total_bytes = 0;
+    bool have_vram_free = false;
+    uint64_t vram_free_bytes = 0;
+    bool have_host_memory = false;
+    uint64_t host_memory_bytes = 0;
+    bool have_host_available = false;
+    uint64_t host_available_bytes = 0;
+    bool have_rounds = false;
+    int rounds = 0;
+    bool have_chunk = false;
+    uint64_t chunk_bytes = 0;
+    std::vector<RoundRecord> tests;
+    bool finished = false;
 
     ~Report() {
         if (fp != nullptr) {
@@ -787,10 +861,10 @@ struct Report {
         const std::time_t now = std::time(nullptr);
         std::tm local{};
         localtime_r(&now, &local);
-        char name[64];
+        char name[80];
         std::snprintf(name,
                       sizeof name,
-                      "vram-test-%04d%02d%02d-%02d%02d%02d.log",
+                      "vram-test-%04d%02d%02d-%02d%02d%02d.json",
                       local.tm_year + 1900,
                       local.tm_mon + 1,
                       local.tm_mday,
@@ -812,68 +886,158 @@ struct Report {
                       local.tm_hour,
                       local.tm_min,
                       local.tm_sec);
-        line("program: verify-rx7900xtx");
-        line("time: %s", when);
-        char host[256] = {};
-        if (gethostname(host, sizeof host - 1) == 0) {
-            line("host: %s", host);
+        time = when;
+        char host_name[256] = {};
+        if (gethostname(host_name, sizeof host_name - 1) == 0) {
+            host = host_name;
         }
         utsname un{};
         if (uname(&un) == 0) {
-            line("kernel: %s %s", un.sysname, un.release);
+            kernel = std::string(un.sysname) + " " + un.release;
         }
-        line("hip: %d.%d.%d", HIP_VERSION_MAJOR, HIP_VERSION_MINOR, HIP_VERSION_PATCH);
+        char hip_text[64];
+        std::snprintf(hip_text, sizeof hip_text, "%d.%d.%d", HIP_VERSION_MAJOR, HIP_VERSION_MINOR, HIP_VERSION_PATCH);
+        hip = hip_text;
         return true;
     }
 
-    void line(const char* fmt, ...) {
-        if (fp == nullptr) {
+    void add_round(const RoundRecord& rec) { tests.push_back(rec); }
+
+    void finish(int exit_code, bool ran, int failed, const std::string& setup_fail) {
+        if (fp == nullptr || finished) {
             return;
         }
-        va_list ap;
-        va_start(ap, fmt);
-        std::vfprintf(fp, fmt, ap);
-        va_end(ap);
-        std::fputc('\n', fp);
+        finished = true;
+
+        std::fprintf(fp, "{\n");
+        std::fprintf(fp, "  \"program\": \"verify-rx7900xtx\",\n");
+        std::fprintf(fp, "  \"time\": ");
+        json_string(fp, time);
+        std::fprintf(fp, ",\n");
+        if (!host.empty()) {
+            std::fprintf(fp, "  \"host\": ");
+            json_string(fp, host);
+            std::fprintf(fp, ",\n");
+        }
+        if (!kernel.empty()) {
+            std::fprintf(fp, "  \"kernel\": ");
+            json_string(fp, kernel);
+            std::fprintf(fp, ",\n");
+        }
+        std::fprintf(fp, "  \"hip\": ");
+        json_string(fp, hip);
+        std::fprintf(fp, ",\n");
+        if (have_device) {
+            std::fprintf(fp, "  \"device\": ");
+            json_string(fp, device);
+            std::fprintf(fp, ",\n  \"arch\": ");
+            json_string(fp, arch);
+            std::fprintf(fp, ",\n  \"pci\": ");
+            json_string(fp, pci);
+            std::fprintf(fp, ",\n");
+        }
+        if (have_vram_total) {
+            std::fprintf(fp, "  \"vram_total_bytes\": %llu,\n", static_cast<unsigned long long>(vram_total_bytes));
+        }
+        if (have_vram_free) {
+            std::fprintf(fp, "  \"vram_free_bytes\": %llu,\n", static_cast<unsigned long long>(vram_free_bytes));
+        }
+        if (have_host_memory) {
+            std::fprintf(fp, "  \"host_memory_bytes\": %llu,\n", static_cast<unsigned long long>(host_memory_bytes));
+        }
+        if (have_host_available) {
+            std::fprintf(fp, "  \"host_available_bytes\": %llu,\n", static_cast<unsigned long long>(host_available_bytes));
+        }
+        if (have_rounds) {
+            std::fprintf(fp, "  \"rounds\": %d,\n", rounds);
+        }
+        if (have_chunk) {
+            std::fprintf(fp, "  \"chunk_bytes\": %llu,\n", static_cast<unsigned long long>(chunk_bytes));
+        }
+
+        std::fprintf(fp, "  \"tests\": [\n");
+        for (size_t i = 0; i < tests.size(); ++i) {
+            write_test(tests[i], i + 1 == tests.size());
+        }
+        std::fprintf(fp, "  ],\n");
+
+        const int passed = ran ? rounds - failed : 0;
+        std::fprintf(fp, "  \"passed\": %d,\n", passed);
+        std::fprintf(fp, "  \"failed\": %d,\n", ran ? failed : 0);
+        std::fprintf(fp, "  \"result\": ");
+        if (!ran) {
+            json_string(fp, "setup_failed");
+        } else if (failed == 0) {
+            json_string(fp, "passed");
+        } else {
+            json_string(fp, "failed");
+        }
+        std::fprintf(fp, ",\n");
+        if (!ran && !setup_fail.empty()) {
+            std::fprintf(fp, "  \"reason\": ");
+            json_string(fp, setup_fail);
+            std::fprintf(fp, ",\n");
+        }
+        std::fprintf(fp, "  \"exit_code\": %d\n", exit_code);
+        std::fprintf(fp, "}\n");
         std::fflush(fp);
     }
 
-    void write_round(const RoundRecord& rec) {
-        if (fp == nullptr) {
-            return;
-        }
-        std::fprintf(fp, "round %d", rec.round);
+    void write_test(const RoundRecord& rec, bool last) {
+        std::fprintf(fp, "    {\n");
+        std::fprintf(fp, "      \"round\": %d", rec.round);
         if (rec.have_seed) {
-            std::fprintf(fp, " seed=0x%016llx", static_cast<unsigned long long>(rec.seed));
+            char seed[32];
+            std::snprintf(seed, sizeof seed, "0x%016llx", static_cast<unsigned long long>(rec.seed));
+            std::fprintf(fp, ",\n      \"seed\": ");
+            json_string(fp, seed);
         }
         if (rec.have_alloc) {
-            std::fprintf(fp,
-                         " allocated_bytes=%llu free_after_bytes=%llu",
-                         static_cast<unsigned long long>(rec.allocated),
-                         static_cast<unsigned long long>(rec.free_after));
+            std::fprintf(fp, ",\n      \"allocated_bytes\": %llu", static_cast<unsigned long long>(rec.allocated));
+            std::fprintf(fp, ",\n      \"free_after_bytes\": %llu", static_cast<unsigned long long>(rec.free_after));
         }
         if (rec.host_pass) {
-            std::fprintf(fp,
-                         " host=PASS h2d=%.1fs %.2fGiB/s d2h=%.1fs %.2fGiB/s",
-                         rec.h2d_s,
-                         rec.h2d_rate,
-                         rec.d2h_s,
-                         rec.d2h_rate);
+            std::fprintf(fp, ",\n      \"host\": {\n");
+            std::fprintf(fp, "        \"result\": \"pass\",\n");
+            std::fprintf(fp, "        \"h2d_seconds\": %.6f,\n", rec.h2d_s);
+            std::fprintf(fp, "        \"h2d_gib_s\": %.6f,\n", rec.h2d_rate);
+            std::fprintf(fp, "        \"d2h_seconds\": %.6f,\n", rec.d2h_s);
+            std::fprintf(fp, "        \"d2h_gib_s\": %.6f\n", rec.d2h_rate);
+            std::fprintf(fp, "      }");
         }
         if (rec.vram_pass) {
-            std::fprintf(fp,
-                         " vram=PASS clear=%.3fs d2d=%.3fs %.2fGiB/s check=%.1fs %.2fGiB/s",
-                         rec.clear_s,
-                         rec.d2d_s,
-                         rec.d2d_rate,
-                         rec.check_s,
-                         rec.check_rate);
+            std::fprintf(fp, ",\n      \"vram\": {\n");
+            std::fprintf(fp, "        \"result\": \"pass\",\n");
+            std::fprintf(fp, "        \"clear_seconds\": %.6f,\n", rec.clear_s);
+            std::fprintf(fp, "        \"d2d_seconds\": %.6f,\n", rec.d2d_s);
+            std::fprintf(fp, "        \"d2d_gib_s\": %.6f,\n", rec.d2d_rate);
+            std::fprintf(fp, "        \"check_seconds\": %.6f,\n", rec.check_s);
+            std::fprintf(fp, "        \"check_gib_s\": %.6f\n", rec.check_rate);
+            std::fprintf(fp, "      }");
         }
         if (!rec.fail.empty()) {
-            std::fprintf(fp, " FAIL %s", rec.fail.c_str());
+            std::fprintf(fp, ",\n      \"error\": ");
+            json_string(fp, rec.fail);
         }
-        std::fputc('\n', fp);
-        std::fflush(fp);
+        if (rec.have_mismatch) {
+            std::fprintf(fp, ",\n      \"mismatch\": {\n");
+            std::fprintf(fp, "        \"offset\": %llu", static_cast<unsigned long long>(rec.mismatch_offset));
+            if (rec.have_source_offset) {
+                std::fprintf(fp, ",\n        \"source_offset\": %llu", static_cast<unsigned long long>(rec.source_offset));
+            }
+            char expected[32];
+            char actual[32];
+            std::snprintf(expected, sizeof expected, "0x%016llx", static_cast<unsigned long long>(rec.expected));
+            std::snprintf(actual, sizeof actual, "0x%016llx", static_cast<unsigned long long>(rec.actual));
+            std::fprintf(fp, ",\n        \"expected\": ");
+            json_string(fp, expected);
+            std::fprintf(fp, ",\n        \"actual\": ");
+            json_string(fp, actual);
+            std::fprintf(fp, "\n      }");
+        }
+        const bool pass = rec.host_pass && rec.vram_pass && rec.fail.empty();
+        std::fprintf(fp, ",\n      \"result\": \"%s\"\n", pass ? "pass" : "fail");
+        std::fprintf(fp, "    }%s\n", last ? "" : ",");
     }
 };
 
@@ -884,7 +1048,7 @@ struct RoundRecorder {
 
     ~RoundRecorder() {
         if (!written && report != nullptr) {
-            report->write_round(rec);
+            report->add_round(rec);
         }
     }
 };
@@ -1021,14 +1185,11 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                          static_cast<unsigned long long>(mismatch.offset),
                          static_cast<unsigned long long>(mismatch.expected),
                          static_cast<unsigned long long>(mismatch.actual));
-            char buf[192];
-            std::snprintf(buf,
-                          sizeof buf,
-                          "host mismatch offset=%llu expected=0x%016llx actual=0x%016llx",
-                          static_cast<unsigned long long>(mismatch.offset),
-                          static_cast<unsigned long long>(mismatch.expected),
-                          static_cast<unsigned long long>(mismatch.actual));
-            rec.fail = buf;
+            rec.fail = "host mismatch";
+            rec.have_mismatch = true;
+            rec.mismatch_offset = mismatch.offset;
+            rec.expected = mismatch.expected;
+            rec.actual = mismatch.actual;
         } else {
             std::fprintf(stderr, "FAIL: round %d VRAM-to-host copy failed\n", round);
             rec.fail = "VRAM-to-host copy failed";
@@ -1092,15 +1253,13 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                          static_cast<unsigned long long>(copy_mismatch.offset - half),
                          static_cast<unsigned long long>(copy_mismatch.expected),
                          static_cast<unsigned long long>(copy_mismatch.actual));
-            char buf[256];
-            std::snprintf(buf,
-                          sizeof buf,
-                          "VRAM copy mismatch offset=%llu source_offset=%llu expected=0x%016llx actual=0x%016llx",
-                          static_cast<unsigned long long>(copy_mismatch.offset),
-                          static_cast<unsigned long long>(copy_mismatch.offset - half),
-                          static_cast<unsigned long long>(copy_mismatch.expected),
-                          static_cast<unsigned long long>(copy_mismatch.actual));
-            rec.fail = buf;
+            rec.fail = "VRAM copy mismatch";
+            rec.have_mismatch = true;
+            rec.have_source_offset = true;
+            rec.mismatch_offset = copy_mismatch.offset;
+            rec.source_offset = copy_mismatch.offset - half;
+            rec.expected = copy_mismatch.expected;
+            rec.actual = copy_mismatch.actual;
         } else {
             std::fprintf(stderr, "FAIL: round %d VRAM copy readback failed\n", round);
             rec.fail = "VRAM copy readback failed";
@@ -1198,6 +1357,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::printf("log: %s\n", report.path.c_str());
+    report.rounds = rounds;
+    report.have_rounds = true;
 
     int exit_code = 2;
     int failed = 0;
@@ -1206,7 +1367,6 @@ int main(int argc, char** argv) {
     struct Finish {
         Report* report = nullptr;
         int* exit_code = nullptr;
-        int rounds = 0;
         int* failed = nullptr;
         bool* ran = nullptr;
         std::string* setup_fail = nullptr;
@@ -1215,20 +1375,11 @@ int main(int argc, char** argv) {
             if (report == nullptr || report->fp == nullptr) {
                 return;
             }
-            if (!*ran) {
-                report->line("result: setup failed");
-                if (setup_fail != nullptr && !setup_fail->empty()) {
-                    report->line("reason: %s", setup_fail->c_str());
-                }
-            } else if (*failed == 0) {
-                report->line("result: %d/%d passed", rounds, rounds);
-            } else {
-                report->line("result: %d/%d passed, %d failed", rounds - *failed, rounds, *failed);
-            }
-            report->line("exit_code: %d", *exit_code);
+            const std::string reason = setup_fail == nullptr ? std::string() : *setup_fail;
+            report->finish(*exit_code, *ran, *failed, reason);
             std::printf("log: %s\n", report->path.c_str());
         }
-    } finish{&report, &exit_code, rounds, &failed, &ran, &setup_fail};
+    } finish{&report, &exit_code, &failed, &ran, &setup_fail};
 
     std::printf("=== VRAM test (RX 7900 XTX) ===\n");
     const int device = find_device();
@@ -1281,20 +1432,25 @@ int main(int argc, char** argv) {
         std::printf("host memory is smaller than VRAM, so the test copies in chunks.\n");
     }
 
-    report.line("device: %s", prop.name);
-    report.line("arch: %s", prop.gcnArchName);
-    report.line("pci: %s", pci.c_str());
-    report.line("vram_total_bytes: %llu", static_cast<unsigned long long>(prop.totalGlobalMem));
-    report.line("vram_free_bytes: %llu", static_cast<unsigned long long>(free_bytes));
-    report.line("host_memory_bytes: %llu", static_cast<unsigned long long>(mem_total));
-    report.line("host_available_bytes: %llu", static_cast<unsigned long long>(mem_avail));
-    report.line("rounds: %d", rounds);
+    report.have_device = true;
+    report.device = prop.name;
+    report.arch = prop.gcnArchName;
+    report.pci = pci;
+    report.have_vram_total = true;
+    report.vram_total_bytes = prop.totalGlobalMem;
+    report.have_vram_free = true;
+    report.vram_free_bytes = free_bytes;
+    report.have_host_memory = true;
+    report.host_memory_bytes = mem_total;
+    report.have_host_available = true;
+    report.host_available_bytes = mem_avail;
 
     size_t chunk = 0;
     if (!choose_chunk(chunk_mib << 20, &chunk, &setup_fail)) {
         return exit_code;
     }
-    report.line("chunk_bytes: %llu", static_cast<unsigned long long>(chunk));
+    report.have_chunk = true;
+    report.chunk_bytes = chunk;
 
     std::printf("rounds: %d  chunk: %s  max leftover: %s\n",
                 rounds,

@@ -4,7 +4,7 @@
 #   make run ROUNDS=10 CHUNK_MIB=256
 #   make clean
 #
-# Each run writes vram-test-YYYYMMDD-HHMMSS.log in the current directory.
+# Each run writes vram-test-YYYYMMDD-HHMMSS.json in the current directory.
 # make clean leaves that log in place.
 
 ROCM  ?= /opt/rocm

@@ -29,7 +29,7 @@ make clean
 6. Print pass or fail. A mismatch reports the round, byte offset, expected value, and actual value.
 7. Free the device and repeat. The run passes only when every round passes. A failure does not skip the remaining rounds.
 
-Each run also writes `vram-test-YYYYMMDD-HHMMSS.log` in the current directory. The file is a few kilobytes: host, GPU, one line per round, and the final pass count. Progress stays on the terminal. `make clean` does not delete the log.
+Each run also writes `vram-test-YYYYMMDD-HHMMSS.json` in the current directory. The file is a few kilobytes of JSON: host, GPU, one object per round, and the final result. Progress stays on the terminal. `make clean` does not delete the log.
 
 | Exit code | Meaning |
 |-----------|---------|
