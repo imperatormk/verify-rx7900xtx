@@ -1595,7 +1595,620 @@ void print_result_table(const Style& style, const Report& report) {
         print_row("vram", [&](const Round& round) { return std::string(mark_of(vram_pass(round))); });
         print_row("round", [](const Round& round) { return std::string(round.result == "pass" ? "O" : "X"); });
     }
+}
+
+void print_wrapped(const Style& style, const std::string& text) {
+    const int width = std::max(24, style.width);
+    const int indent = 2;
+    std::string line;
+    int cols = 0;
+    std::string word;
+    auto flush = [&]() {
+        if (!line.empty()) {
+            std::cout << line << "\n";
+            line.clear();
+            cols = 0;
+        }
+    };
+    auto take = [&](const std::string& token) {
+        const int w = utf8_cols(token);
+        if (line.empty()) {
+            line = std::string(static_cast<size_t>(indent), ' ') + token;
+            cols = indent + w;
+            return;
+        }
+        if (cols + 1 + w > width) {
+            flush();
+            line = std::string(static_cast<size_t>(indent), ' ') + token;
+            cols = indent + w;
+            return;
+        }
+        line += " ";
+        line += token;
+        cols += 1 + w;
+    };
+    for (size_t i = 0; i <= text.size(); ++i) {
+        const bool end = i == text.size();
+        const unsigned char c = end ? ' ' : static_cast<unsigned char>(text[i]);
+        if (c == ' ' || c == '\n' || c == '\t') {
+            if (!word.empty()) {
+                take(word);
+                word.clear();
+            }
+            continue;
+        }
+        word.push_back(static_cast<char>(c));
+    }
+    flush();
+}
+
+void print_prose(const Style& style, const std::string& text) {
+    if (!text.empty()) {
+        print_wrapped(style, text);
+    }
+}
+
+void add_sentence(std::string* text, const std::string& sentence) {
+    if (sentence.empty()) {
+        return;
+    }
+    if (!text->empty()) {
+        *text += " ";
+    }
+    *text += sentence;
+}
+
+std::string count_phrase(int n, const char* one, const char* many) {
+    return std::to_string(n) + " " + (n == 1 ? one : many);
+}
+
+struct RateSpan {
+    bool any = false;
+    double lo = 0;
+    double hi = 0;
+
+    void add(double value) {
+        if (!any) {
+            lo = hi = value;
+            any = true;
+            return;
+        }
+        lo = std::min(lo, value);
+        hi = std::max(hi, value);
+    }
+};
+
+std::string format_gib_span(const RateSpan& span) {
+    char buf[80];
+    if (std::fabs(span.lo - span.hi) < 0.005) {
+        std::snprintf(buf, sizeof buf, "%.2f GiB/s", span.lo);
+    } else {
+        std::snprintf(buf, sizeof buf, "%.2f-%.2f GiB/s", span.lo, span.hi);
+    }
+    return buf;
+}
+
+std::string join_rates(const std::vector<std::pair<const char*, RateSpan>>& items) {
+    std::vector<std::string> parts;
+    for (const auto& item : items) {
+        if (item.second.any) {
+            parts.push_back(std::string(item.first) + " " + format_gib_span(item.second));
+        }
+    }
+    if (parts.empty()) {
+        return "";
+    }
+    if (parts.size() == 1) {
+        return parts[0];
+    }
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) {
+            out += i + 1 == parts.size() ? ", and " : ", ";
+        }
+        out += parts[i];
+    }
+    return out;
+}
+
+struct TempSpan {
+    std::string name;
+    bool any = false;
+    int64_t lo = 0;
+    int64_t hi = 0;
+    bool have_crit = false;
+    bool crit_same = true;
+    int64_t crit = 0;
+    bool have_emerg = false;
+    bool emerg_same = true;
+    int64_t emerg = 0;
+
+    void add_sample(int64_t value) {
+        if (!any) {
+            lo = hi = value;
+            any = true;
+            return;
+        }
+        lo = std::min(lo, value);
+        hi = std::max(hi, value);
+    }
+
+    void add_crit(int64_t value) {
+        if (!have_crit) {
+            crit = value;
+            have_crit = true;
+            return;
+        }
+        if (crit != value) {
+            crit_same = false;
+        }
+    }
+
+    void add_emerg(int64_t value) {
+        if (!have_emerg) {
+            emerg = value;
+            have_emerg = true;
+            return;
+        }
+        if (emerg != value) {
+            emerg_same = false;
+        }
+    }
+};
+
+TempSpan* find_temp(std::vector<TempSpan>* temps, const std::string& name) {
+    for (TempSpan& item : *temps) {
+        if (item.name == name) {
+            return &item;
+        }
+    }
+    temps->push_back(TempSpan{});
+    temps->back().name = name;
+    return &temps->back();
+}
+
+std::string temp_sentence(const TempSpan& sensor) {
+    std::string text = "The " + sensor.name + " sensor ";
+    if (sensor.lo == sensor.hi) {
+        text += "read " + format_celsius(sensor.lo);
+    } else {
+        text += "ranged from " + format_celsius(sensor.lo) + " to " + format_celsius(sensor.hi);
+    }
+    if (!sensor.have_crit || !sensor.crit_same) {
+        if (!sensor.have_crit) {
+            text += ". No critical limit is recorded for it.";
+        } else {
+            text += ". Its critical limit is not the same on every sample.";
+        }
+        return text;
+    }
+    if (sensor.have_emerg && sensor.emerg_same && sensor.hi >= sensor.emerg) {
+        text += ". The high sample is over the emergency limit of " + format_celsius(sensor.emerg) + ".";
+        return text;
+    }
+    if (sensor.hi >= sensor.crit) {
+        text += ". The high sample is over the critical limit of " + format_celsius(sensor.crit);
+        if (sensor.have_emerg && sensor.emerg_same) {
+            text += " and under the emergency limit of " + format_celsius(sensor.emerg);
+        }
+        text += ".";
+        return text;
+    }
+    text += ", under the critical limit of " + format_celsius(sensor.crit);
+    if (sensor.have_emerg && sensor.emerg_same) {
+        text += " and the emergency limit of " + format_celsius(sensor.emerg);
+    }
+    text += ".";
+    return text;
+}
+
+const char* summary_layer_limits() {
+    return "This test calls the HIP host API only. A mismatch or a HIP error can show that the copy path failed, but the log cannot tell whether the fault is in HIP or in a layer below it: the kernel driver, firmware, PCIe, the copy engine, or VRAM. "
+           "The host check and the VRAM check name different copies. Neither names the layer. "
+           "The result does not cover compute units, shaders, matrix instructions, caches used only by a kernel, corrected ECC errors that leave the final bytes unchanged, engines other than this copy path, or faults rarer than the recorded rounds.";
+}
+
+std::string failure_sentence(const Round& round) {
+    std::string text = "Round " + std::to_string(round.round) + " ";
+    if (!round.host.present && !round.vram.present) {
+        text += "failed before the host check completed";
+    } else if (round.host.present && !round.vram.present) {
+        text += "passed the host check and failed the VRAM check";
+    } else if (!round.host.present && round.vram.present) {
+        text += "has a VRAM result without a host result";
+    } else {
+        text += "is marked fail with both checks present";
+    }
+    text += ".";
+    if (!round.error.empty()) {
+        text += " The error is \"" + round.error + "\".";
+    }
+    if (round.mismatch.present) {
+        text += " The first mismatch is at byte offset " + std::to_string(round.mismatch.offset);
+        if (round.mismatch.have_source) {
+            text += ", from source offset " + std::to_string(round.mismatch.source);
+        }
+        if (!round.mismatch.expected.empty() || !round.mismatch.actual.empty()) {
+            text += ", expected " + round.mismatch.expected + ", actual " + round.mismatch.actual;
+        }
+        text += ".";
+    }
+    return text;
+}
+
+std::string summary_environment(const Report& report) {
+    std::string text;
+    if (!report.time.empty() || !report.host.empty()) {
+        std::string sentence = "This log was recorded";
+        if (!report.time.empty()) {
+            sentence += " at " + report.time;
+        }
+        if (!report.host.empty()) {
+            sentence += " on host " + report.host;
+        }
+        sentence += ".";
+        add_sentence(&text, sentence);
+    }
+    if (!report.kernel.empty() && !report.hip.empty()) {
+        add_sentence(&text, "The kernel was " + report.kernel + ", and the HIP runtime was " + report.hip + ".");
+    } else if (!report.kernel.empty()) {
+        add_sentence(&text, "The kernel was " + report.kernel + ".");
+    } else if (!report.hip.empty()) {
+        add_sentence(&text, "The HIP runtime was " + report.hip + ".");
+    }
+    if (!report.device.empty()) {
+        std::string sentence = "The device was " + report.device;
+        if (!report.arch.empty()) {
+            sentence += " (" + report.arch + ")";
+        }
+        if (!report.pci.empty()) {
+            sentence += " at PCI " + report.pci;
+        }
+        sentence += ".";
+        add_sentence(&text, sentence);
+    }
+    if (report.have_vram_total) {
+        std::string sentence = "VRAM total was " + format_bytes(report.vram_total);
+        if (report.have_vram_free) {
+            sentence += ", of which " + format_bytes(report.vram_free) + " was free at the start";
+        }
+        sentence += ".";
+        add_sentence(&text, sentence);
+    }
+    if (report.have_host_memory) {
+        std::string sentence = "Host memory was " + format_bytes(report.host_memory);
+        if (report.have_host_available) {
+            sentence += ", with " + format_bytes(report.host_available) + " available";
+        }
+        sentence += ".";
+        add_sentence(&text, sentence);
+    }
+    if (report.have_rounds || report.have_chunk) {
+        std::string sentence = "The run was configured for ";
+        if (report.have_rounds) {
+            sentence += count_phrase(report.rounds, "round", "rounds");
+        }
+        if (report.have_chunk) {
+            if (report.have_rounds) {
+                sentence += " and ";
+            }
+            sentence += "a " + format_bytes(report.chunk) + " staging chunk";
+        }
+        sentence += ".";
+        add_sentence(&text, sentence);
+    }
+    if (text.empty()) {
+        text = "The log does not name the host, the kernel, the runtime, or the device.";
+    }
+    return text;
+}
+
+const char* summary_method_fill() {
+    return "Each round allocates the free VRAM, up to 1 GiB per block, and fills it with hipMemcpy from one host staging chunk. The host does not keep the full image. It rebuilds every 64-bit word from the round seed, so the check does not need host RAM as large as VRAM. The fill passes only when HIP free memory after allocation, unaccounted memory (free before allocation, minus the allocated size, minus free after allocation), and sysfs free memory are each at most 256 MiB. The staging buffer is cleared, the allocation is copied back, and every word is compared with the rebuilt pattern.";
+}
+
+const char* summary_method_copy() {
+    return "The allocation is then split in half on an 8-byte boundary. hipMemset clears the second half, and hipMemcpy copies the first half onto it on the device. The second half is read back and compared with the pattern at the source offset. These copies use the HIP host API only. No device kernel is launched. Temperature comes from the amdgpu hwmon node at the start of the round and again after the copies, and it does not change pass or fail. The allocation is freed and the device is reset before the next round. A failed round does not stop the later rounds.";
+}
+
+std::string summary_result(const Report& report) {
+    const int n = static_cast<int>(report.tests.size());
+    int pass_n = 0;
+    std::vector<const Round*> failed;
+    for (const Round& round : report.tests) {
+        if (round.result == "pass") {
+            ++pass_n;
+        } else {
+            failed.push_back(&round);
+        }
+    }
+    const int fail_n = static_cast<int>(failed.size());
+    std::string text;
+
+    auto exit_clause = [&]() {
+        if (!report.have_exit) {
+            return std::string();
+        }
+        return " The exit code is " + std::to_string(report.exit_code) + ".";
+    };
+
+    if (n == 0 && report.result == "setup_failed") {
+        add_sentence(&text, "Setup failed before any round was recorded, so the copy checks did not run.");
+        if (!report.reason.empty()) {
+            add_sentence(&text, "The recorded reason is \"" + report.reason + "\".");
+        }
+        if (report.have_exit) {
+            add_sentence(&text, "The exit code is " + std::to_string(report.exit_code) + ".");
+        }
+        return text;
+    }
+    if (n == 0) {
+        add_sentence(&text, "The log contains no rounds, so it does not show whether the copies passed or failed.");
+        if (!report.result.empty()) {
+            add_sentence(&text, "The log result is " + report.result + ".");
+        }
+        if (!report.reason.empty()) {
+            add_sentence(&text, "The recorded reason is \"" + report.reason + "\".");
+        }
+        if (report.have_exit) {
+            add_sentence(&text, "The exit code is " + std::to_string(report.exit_code) + ".");
+        }
+        return text;
+    }
+
+    const bool partial = report.have_rounds && n < report.rounds;
+    if (report.result == "in_progress") {
+        std::string sentence = "The run is still in progress";
+        if (partial) {
+            sentence += ": " + std::to_string(n) + " of " + std::to_string(report.rounds) + " planned rounds are recorded";
+        }
+        sentence += ".";
+        add_sentence(&text, sentence);
+        add_sentence(&text, "This is not a final result, and no exit code has been written.");
+    } else if (partial) {
+        add_sentence(&text, "The log holds " + std::to_string(n) + " of " + std::to_string(report.rounds) + " planned rounds.");
+    }
+
+    auto every = [](int count) {
+        if (count == 1) {
+            return std::string("The one recorded round");
+        }
+        if (count == 2) {
+            return std::string("Both recorded rounds");
+        }
+        return "All " + std::to_string(count) + " recorded rounds";
+    };
+    if (fail_n == 0) {
+        add_sentence(&text, "No failure was recorded. " + every(n) + " passed the host check and the VRAM check.");
+    } else if (pass_n == 0) {
+        add_sentence(&text, (n == 1 ? "A failure was recorded. " : "Failures were recorded. ") + every(n) + " failed.");
+    } else {
+        add_sentence(&text,
+                     "Failures were recorded. " + std::to_string(pass_n) + " of " + std::to_string(n) + " recorded rounds passed, and "
+                         + std::to_string(fail_n) + " failed.");
+    }
+    for (const Round* round : failed) {
+        add_sentence(&text, failure_sentence(*round));
+    }
+
+    if (report.result == "passed" || report.result == "failed") {
+        add_sentence(&text, "The log result is " + report.result + "." + exit_clause());
+    } else if (report.result == "setup_failed") {
+        add_sentence(&text, "The log result is setup_failed." + exit_clause());
+        if (!report.reason.empty()) {
+            add_sentence(&text, "The recorded reason is \"" + report.reason + "\".");
+        }
+    } else if (!report.result.empty() && report.result != "in_progress") {
+        add_sentence(&text, "The log result is " + report.result + "." + exit_clause());
+    } else if (report.have_exit) {
+        add_sentence(&text, "The exit code is " + std::to_string(report.exit_code) + ".");
+    }
+    return text;
+}
+
+void summary_findings(const Report& report, std::string* known, std::string* open) {
+    const int n = static_cast<int>(report.tests.size());
+    int host_ok = 0;
+    int vram_ok = 0;
+    bool any_alloc = false;
+    uint64_t alloc_min = 0;
+    uint64_t alloc_max = 0;
+    uint64_t free_min = 0;
+    uint64_t free_max = 0;
+    RateSpan h2d, d2h, d2d, check;
+    std::vector<TempSpan> temps;
+
+    for (const Round& round : report.tests) {
+        const bool pass = round.result == "pass";
+        if (round.host.present || pass) {
+            ++host_ok;
+        }
+        if (round.vram.present || pass) {
+            ++vram_ok;
+        }
+        if (round.have_alloc) {
+            if (!any_alloc) {
+                alloc_min = alloc_max = round.allocated;
+                free_min = free_max = round.free_after;
+                any_alloc = true;
+            } else {
+                alloc_min = std::min(alloc_min, round.allocated);
+                alloc_max = std::max(alloc_max, round.allocated);
+                free_min = std::min(free_min, round.free_after);
+                free_max = std::max(free_max, round.free_after);
+            }
+        }
+        if (round.host.present) {
+            h2d.add(round.host.h2d);
+            d2h.add(round.host.d2h);
+        }
+        if (round.vram.present) {
+            d2d.add(round.vram.d2d);
+            check.add(round.vram.check);
+        }
+        for (const TempSensor& sensor : round.temperature) {
+            TempSpan* dest = find_temp(&temps, sensor.name.empty() ? std::string("unnamed") : sensor.name);
+            if (sensor.have_before) {
+                dest->add_sample(sensor.before_mc);
+            }
+            if (sensor.have_after) {
+                dest->add_sample(sensor.after_mc);
+            }
+            if (sensor.have_critical) {
+                dest->add_crit(sensor.critical_mc);
+            }
+            if (sensor.have_emergency) {
+                dest->add_emerg(sensor.emergency_mc);
+            }
+        }
+    }
+
+    if (n == 0) {
+        add_sentence(known, "No copy was measured, so the log establishes nothing about byte integrity, bandwidth, or temperature.");
+        if (!report.reason.empty()) {
+            add_sentence(known, "The setup failure reason above is the only fault the log names.");
+        }
+        add_sentence(open, "Whether this device would pass the host readback or the VRAM copy is not known.");
+        add_sentence(open, summary_layer_limits());
+        return;
+    }
+
+    auto every = [](int count) {
+        if (count == 1) {
+            return std::string("The one recorded round");
+        }
+        if (count == 2) {
+            return std::string("Both recorded rounds");
+        }
+        return "All " + std::to_string(count) + " recorded rounds";
+    };
+    if (host_ok == n && vram_ok == n) {
+        add_sentence(known, every(n) + " matched on both paths. The host readback agreed with the seed pattern, and the device-to-device copy agreed with the source half.");
+    } else {
+        auto confirmed = [&](int count, const char* path) {
+            if (count == n) {
+                return std::string(path) + " was confirmed on every recorded round.";
+            }
+            return std::string(path) + " was confirmed on " + std::to_string(count) + " of " + std::to_string(n) + " rounds.";
+        };
+        add_sentence(known, confirmed(host_ok, "The host readback"));
+        add_sentence(known, confirmed(vram_ok, "The device-to-device copy"));
+        add_sentence(known, "A round with no completed check does not confirm the bytes for that path.");
+    }
+
+    if (any_alloc) {
+        const std::string alloc_lo = format_bytes(alloc_min);
+        const std::string alloc_hi = format_bytes(alloc_max);
+        std::string sentence;
+        if (alloc_min == alloc_max) {
+            sentence = "Each recorded allocation was " + alloc_lo;
+        } else if (alloc_lo == alloc_hi) {
+            sentence = "Recorded allocations were about " + alloc_lo;
+        } else {
+            sentence = "Recorded allocations ranged from " + alloc_lo + " to " + alloc_hi;
+        }
+        sentence += ". ";
+        const std::string free_lo = format_bytes(free_min);
+        const std::string free_hi = format_bytes(free_max);
+        if (free_lo == free_hi) {
+            sentence += "HIP free memory after allocation was " + free_hi + " on every recorded round.";
+        } else {
+            sentence += "HIP free memory after allocation ranged from " + free_lo + " to " + free_hi + ".";
+        }
+        add_sentence(known, sentence);
+    }
+
+    const bool host_done = host_ok == n;
+    if (any_alloc && report.have_host_memory && report.host_memory < alloc_max) {
+        std::string sentence = "That allocation is larger than host memory (" + format_bytes(report.host_memory) + ")";
+        if (report.have_host_available) {
+            sentence += ", and larger than the " + format_bytes(report.host_available) + " that was available";
+        }
+        sentence += host_done ? ". The staging chunk was enough to fill that allocation and read it back."
+                              : ". Rounds that did not finish the host check do not show that the chunk was sufficient.";
+        add_sentence(known, sentence);
+    } else if (any_alloc && report.have_host_available && report.host_available < alloc_max) {
+        std::string sentence = "Available host memory (" + format_bytes(report.host_available) + ") was smaller than the allocation ("
+                               + format_bytes(alloc_max) + ")";
+        sentence += host_done ? ". The staging chunk was enough to fill that allocation and read it back."
+                              : ". Rounds that did not finish the host check do not show that the chunk was sufficient.";
+        add_sentence(known, sentence);
+    }
+
+    const std::string rates = join_rates({
+        {"host-to-VRAM", h2d},
+        {"VRAM-to-host", d2h},
+        {"VRAM-to-VRAM", d2d},
+        {"readback", check},
+    });
+    if (!rates.empty()) {
+        add_sentence(known, "Observed copy rates were " + rates + ".");
+    }
+
+    bool any_temp = false;
+    for (const TempSpan& sensor : temps) {
+        if (!sensor.any) {
+            continue;
+        }
+        any_temp = true;
+        add_sentence(known, temp_sentence(sensor));
+    }
+
+    if (any_temp) {
+        add_sentence(open, "Temperature during a copy is not known. The log stores only the sample before the round and the sample after the copies.");
+    } else {
+        add_sentence(open, "Temperature on this run is not known, because the log has no sensor samples.");
+    }
+    add_sentence(open, "Power, clocks, fan speed, and device error counters are not recorded.");
+    {
+        std::string sentence = "The outcome covers the seeds and the rounds in this file";
+        if (report.have_chunk) {
+            sentence += ", using a " + format_bytes(report.chunk) + " chunk";
+        }
+        sentence += ". Other seeds, other chunk sizes, other devices, and a longer run are not known.";
+        add_sentence(open, sentence);
+    }
+    if (report.result == "in_progress" || (report.have_rounds && n < report.rounds)) {
+        add_sentence(open, "Rounds that are not in the log have no result.");
+    }
+    if (any_alloc && report.have_host_memory && report.host_memory >= alloc_max && (!report.have_vram_total || report.host_memory >= report.vram_total)) {
+        add_sentence(open, "Host memory was at least as large as the filled VRAM, so this run does not show a fill that cannot fit in host RAM.");
+    }
+    add_sentence(open, summary_layer_limits());
+}
+
+void print_summary(const Style& style, const Report& report) {
     std::cout << "\n";
+    std::cout << style.paint("  Summary", kBold) << "\n";
+
+    const char* result_color = kBold;
+    if (report.result == "passed") {
+        result_color = kGreen;
+    } else if (report.result == "failed" || report.result == "setup_failed") {
+        result_color = kRed;
+    } else if (report.result == "in_progress") {
+        result_color = kYellow;
+    }
+
+    std::cout << "\n" << style.paint("  Environment", kBold) << "\n";
+    print_prose(style, summary_environment(report));
+    std::cout << "\n" << style.paint("  Method", kBold) << "\n";
+    print_prose(style, summary_method_fill());
+    std::cout << "\n";
+    print_prose(style, summary_method_copy());
+    const std::string result_esc = std::string(kBold) + result_color;
+    std::cout << "\n" << style.paint("  Result", result_esc.c_str()) << "\n";
+    print_prose(style, summary_result(report));
+
+    std::string known;
+    std::string open;
+    summary_findings(report, &known, &open);
+    std::cout << "\n" << style.paint("  Findings", kBold) << "\n";
+    print_prose(style, known);
+    if (!open.empty()) {
+        std::cout << "\n";
+        print_prose(style, open);
+    }
 }
 
 void print_bandwidth_history(const Style& style, const Report& report) {
@@ -1829,6 +2442,7 @@ void render(const Style& style, const Report& report) {
     print_bandwidth_history(style, report);
     print_temperature_history(style, report);
     print_result_table(style, report);
+    print_summary(style, report);
 }
 
 std::string read_stream(std::istream& in) {

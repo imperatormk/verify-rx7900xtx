@@ -4,6 +4,16 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 18:40:56 — State the layer limit at the end of the Summary
+
+- The Summary ends by stating that a mismatch or a HIP error cannot separate a HIP fault from the kernel driver, firmware, PCIe, the copy engine, or VRAM
+- The host check and the VRAM check name different copies, not the layer. Compute paths, corrected ECC, other engines, and rarer faults are outside the result
+
+## 2026-10-21 18:25:51 — Add a Summary to the end of the report
+
+- `vram-view` ends with a Summary in prose: the machine, the method, whether a failure was recorded, and what the log does and does not establish
+- The Summary wraps on word boundaries within the report width
+
 ## 2026-10-21 18:10:14 — List every round as an O/X table
 
 - The last block of `vram-view` is a table of host, VRAM, and round results
