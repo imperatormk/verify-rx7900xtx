@@ -4,6 +4,12 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 15:38:34 — Replace the JSON log after every round
+
+- After each round, write the rounds finished so far to a temporary file and `rename` it over the JSON log
+- `result` stays `"in_progress"` until the run finishes, when it becomes `"passed"`, `"failed"`, or `"setup_failed"` and `exit_code` is added
+- `make clean` removes a leftover temporary file and keeps the JSON log
+
 ## 2026-10-21 15:13:20 — Write the result log as JSON
 
 - The result file is now `vram-test-YYYYMMDD-HHMMSS.json`

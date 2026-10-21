@@ -848,7 +848,7 @@ struct Report {
     bool have_chunk = false;
     uint64_t chunk_bytes = 0;
     std::vector<RoundRecord> tests;
-    bool finished = false;
+    bool finalized = false;
 
     ~Report() {
         if (fp != nullptr) {
@@ -872,10 +872,6 @@ struct Report {
                       local.tm_min,
                       local.tm_sec);
         path = name;
-        fp = std::fopen(path.c_str(), "w");
-        if (fp == nullptr) {
-            return false;
-        }
         char when[80];
         std::snprintf(when,
                       sizeof when,
@@ -903,11 +899,25 @@ struct Report {
 
     void add_round(const RoundRecord& rec) { tests.push_back(rec); }
 
-    void finish(int exit_code, bool ran, int failed, const std::string& setup_fail) {
-        if (fp == nullptr || finished) {
-            return;
+    int count_failed() const {
+        int n = 0;
+        for (const RoundRecord& rec : tests) {
+            if (!(rec.host_pass && rec.vram_pass && rec.fail.empty())) {
+                ++n;
+            }
         }
-        finished = true;
+        return n;
+    }
+
+    // Rewrite the JSON through a temporary file in the same directory, then rename it
+    // over the destination so readers never see a partial document.
+    bool write_snapshot(const char* result, int passed, int failed, int exit_code, bool write_exit, const std::string& setup_fail) {
+        const std::string tmp_path = path + ".tmp";
+        fp = std::fopen(tmp_path.c_str(), "w");
+        if (fp == nullptr) {
+            std::fprintf(stderr, "FAIL: could not write %s\n", tmp_path.c_str());
+            return false;
+        }
 
         std::fprintf(fp, "{\n");
         std::fprintf(fp, "  \"program\": \"verify-rx7900xtx\",\n");
@@ -961,26 +971,64 @@ struct Report {
         }
         std::fprintf(fp, "  ],\n");
 
-        const int passed = ran ? rounds - failed : 0;
         std::fprintf(fp, "  \"passed\": %d,\n", passed);
-        std::fprintf(fp, "  \"failed\": %d,\n", ran ? failed : 0);
+        std::fprintf(fp, "  \"failed\": %d,\n", failed);
         std::fprintf(fp, "  \"result\": ");
-        if (!ran) {
-            json_string(fp, "setup_failed");
-        } else if (failed == 0) {
-            json_string(fp, "passed");
-        } else {
-            json_string(fp, "failed");
-        }
-        std::fprintf(fp, ",\n");
-        if (!ran && !setup_fail.empty()) {
-            std::fprintf(fp, "  \"reason\": ");
+        json_string(fp, result);
+        if (!setup_fail.empty()) {
+            std::fprintf(fp, ",\n  \"reason\": ");
             json_string(fp, setup_fail);
-            std::fprintf(fp, ",\n");
         }
-        std::fprintf(fp, "  \"exit_code\": %d\n", exit_code);
-        std::fprintf(fp, "}\n");
-        std::fflush(fp);
+        if (write_exit) {
+            std::fprintf(fp, ",\n  \"exit_code\": %d", exit_code);
+        }
+        std::fprintf(fp, "\n}\n");
+        if (std::fflush(fp) != 0) {
+            std::fclose(fp);
+            fp = nullptr;
+            std::remove(tmp_path.c_str());
+            std::fprintf(stderr, "FAIL: could not flush %s\n", tmp_path.c_str());
+            return false;
+        }
+        const int fd = fileno(fp);
+        if (fd >= 0 && fsync(fd) != 0) {
+            std::fclose(fp);
+            fp = nullptr;
+            std::remove(tmp_path.c_str());
+            std::fprintf(stderr, "FAIL: could not flush %s to disk\n", tmp_path.c_str());
+            return false;
+        }
+        std::fclose(fp);
+        fp = nullptr;
+        if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+            std::remove(tmp_path.c_str());
+            std::fprintf(stderr, "FAIL: could not replace %s\n", path.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    void publish_progress() {
+        const int failed = count_failed();
+        const int passed = static_cast<int>(tests.size()) - failed;
+        (void)write_snapshot("in_progress", passed, failed, 0, false, "");
+    }
+
+    void finish(int exit_code, bool ran, int failed, const std::string& setup_fail) {
+        if (finalized) {
+            return;
+        }
+        finalized = true;
+        if (!ran) {
+            (void)write_snapshot("setup_failed", 0, 0, exit_code, true, setup_fail);
+            return;
+        }
+        const int passed = rounds - failed;
+        if (failed == 0) {
+            (void)write_snapshot("passed", passed, failed, exit_code, true, "");
+        } else {
+            (void)write_snapshot("failed", passed, failed, exit_code, true, "");
+        }
     }
 
     void write_test(const RoundRecord& rec, bool last) {
@@ -1372,7 +1420,7 @@ int main(int argc, char** argv) {
         std::string* setup_fail = nullptr;
 
         ~Finish() {
-            if (report == nullptr || report->fp == nullptr) {
+            if (report == nullptr) {
                 return;
             }
             const std::string reason = setup_fail == nullptr ? std::string() : *setup_fail;
@@ -1463,6 +1511,7 @@ int main(int argc, char** argv) {
         if (!run_round(round, rounds, device, chunk, sysfs_path, &report)) {
             ++failed;
         }
+        report.publish_progress();
     }
 
     std::printf("\nresult: %d/%d passed", rounds - failed, rounds);

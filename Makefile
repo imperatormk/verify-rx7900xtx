@@ -5,7 +5,7 @@
 #   make clean
 #
 # Each run writes vram-test-YYYYMMDD-HHMMSS.json in the current directory.
-# make clean leaves that log in place.
+# The file is replaced after every round. make clean leaves that log in place.
 
 ROCM  ?= /opt/rocm
 CXX   ?= g++
@@ -32,4 +32,4 @@ run: build
 	./$(TARGET) $(ROUNDS) $(CHUNK_MIB)
 
 clean:
-	rm -f $(TARGET) gpucore.*
+	rm -f $(TARGET) gpucore.* vram-test-*.json.tmp

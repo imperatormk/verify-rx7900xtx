@@ -1,4 +1,5 @@
 vram-test
 vram-test-*.log
 vram-test-*.json
+vram-test-*.json.tmp
 gpucore.*
