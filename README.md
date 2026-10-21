@@ -2,7 +2,7 @@
 
 VRAM test for the AMD Radeon RX 7900 XTX (`gfx1100`, about 24 GiB).
 
-Each round fills free VRAM from host memory, copies it back, and checks that every byte matches. `make run` does this 10 times. The test still works when host RAM is smaller than VRAM: the host keeps only a staging chunk and rebuilds the expected bytes from a per-round seed.
+Each round fills free VRAM from host memory, copies it back, and checks that every byte matches. It then copies the first half of that VRAM onto the second half and checks that copy. `make run` does this 10 times. The test still works when host RAM is smaller than VRAM: the host keeps only a staging chunk and rebuilds the expected bytes from a per-round seed.
 
 ## Usage
 
@@ -24,8 +24,8 @@ make clean
 1. Read the VRAM capacity.
 2. Allocate the free VRAM and copy a random pattern from the host until it is full.
 3. Confirm that both HIP and sysfs show at most 256 MiB free.
-4. Copy the VRAM contents back to the host.
-5. Compare every byte with the original pattern.
+4. Copy the VRAM contents back to the host and compare every byte with the original pattern.
+5. Clear the second half, copy the first half onto it inside VRAM, and compare the second half with the first half's pattern.
 6. Print pass or fail. A mismatch reports the round, byte offset, expected value, and actual value.
 7. Free the device and repeat. The run passes only when every round passes. A failure does not skip the remaining rounds.
 

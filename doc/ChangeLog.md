@@ -4,6 +4,12 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 14:25:24 — Add a VRAM-to-VRAM copy check
+
+- After the host copy check, each round clears the second half of the allocation and copies the first half onto it with `hipMemcpyDeviceToDevice`
+- The second half is read back and compared with the first half's pattern
+- `README.md` and `doc/design.md` describe the extra steps
+
 ## 2026-10-21 13:57:35 — Add a short README
 
 - Added `README.md` with a short version of the usage and the per-round check

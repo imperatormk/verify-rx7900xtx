@@ -4,7 +4,7 @@
 
 ## Overview
 
-The test copies data between host memory and the AMD Radeon RX 7900 XTX VRAM, then compares every byte. It repeats that check 10 times. The same procedure works when physical host memory is smaller than VRAM.
+The test copies data between host memory and the AMD Radeon RX 7900 XTX VRAM, then compares every byte. It then copies the first half of that VRAM onto the second half and compares the copy. It repeats both checks 10 times. The same procedure works when physical host memory is smaller than VRAM.
 
 The target device is the HIP device whose name contains `7900 XTX`. Its architecture name is `gfx1100`, and its VRAM size is about 24 GiB.
 
@@ -37,7 +37,7 @@ make clean                       # remove vram-test and gpucore.*
 
 The binary is invoked as `./vram-test <rounds> <chunk_mib>`. Running it with no arguments also uses 10 rounds and a 256 MiB chunk.
 
-The only dependency is the ROCm HIP runtime (`libamdhip64`). There is no device kernel. The host uses `hipMalloc` and `hipMemcpy` only.
+The only dependency is the ROCm HIP runtime (`libamdhip64`). There is no device kernel. The host uses `hipMalloc`, `hipMemset`, and `hipMemcpy` only.
 
 ## One round
 
@@ -57,13 +57,19 @@ The only dependency is the ROCm HIP runtime (`libamdhip64`). There is no device 
 4. **Copy VRAM back to the host.**  
    Use `hipMemcpyDeviceToHost` with the same chunk size. The staging buffer is zeroed before each copy.
 
-5. **Check for an exact match.**  
+5. **Check the host copy.**  
    Compare the returned chunk with the value regenerated from the same seed and offset, 8 bytes at a time.
 
-6. **Report pass or fail.**  
-   On a mismatch, write the round number, the byte offset from the start of VRAM, the expected value, and the actual value to stderr. That round fails.
+6. **Copy inside VRAM.**  
+   Split the allocation in half on an 8-byte boundary. Clear the second half with `hipMemset`, then copy the first half onto it with `hipMemcpyDeviceToDevice`. A copy stops at the next block boundary and continues in the following block. The two halves do not overlap.
 
-7. **Repeat.**  
+7. **Check the VRAM copy.**  
+   Read the second half back in the same chunk size. Before each read, zero the staging buffer. Compare every byte with the pattern of the matching offset in the first half, not with the pattern of the destination offset.
+
+8. **Report pass or fail.**  
+   On a mismatch, write the round number, the byte offset from the start of the allocation, the expected value, and the actual value to stderr. A VRAM-copy mismatch also includes the source offset. That round fails.
+
+9. **Repeat.**  
    At the end of the round, free the VRAM and call `hipDeviceReset` so the runtime cache releases it. The next round starts again by reading free capacity. The process succeeds only when all 10 rounds succeed. A failed round does not stop the remaining rounds.
 
 ## When host memory is smaller than VRAM

@@ -3,6 +3,9 @@
 // Works when host RAM is smaller than VRAM. The host only holds a staging
 // chunk. Each 8-byte word is a function of the seed and the word index, so the
 // expected bytes can be rebuilt on readback and compared directly.
+//
+// After the host copy check, the first half of the allocation is copied onto
+// the second half with hipMemcpyDeviceToDevice and checked the same way.
 
 #include <hip/hip_runtime_api.h>
 
@@ -542,6 +545,134 @@ bool transfer_and_check(const std::vector<Block>& blocks,
     return true;
 }
 
+bool locate_span(const std::vector<Block>& blocks, uint64_t logical, uint8_t** ptr, size_t* room) {
+    for (const Block& block : blocks) {
+        const uint64_t end = block.base + block.bytes;
+        if (logical >= block.base && logical < end) {
+            const size_t off = static_cast<size_t>(logical - block.base);
+            *ptr = static_cast<uint8_t*>(block.ptr) + off;
+            *room = block.bytes - off;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool zero_device_range(const std::vector<Block>& blocks, uint64_t begin, uint64_t end) {
+    const uint64_t total = end - begin;
+    uint64_t done = 0;
+    print_progress("clear VRAM dst", 0, total);
+    while (done < total) {
+        uint8_t* ptr = nullptr;
+        size_t room = 0;
+        if (!locate_span(blocks, begin + done, &ptr, &room)) {
+            std::fprintf(stderr, "\nFAIL: clear range is outside the allocation\n");
+            return false;
+        }
+        size_t nbytes = room;
+        if (static_cast<uint64_t>(nbytes) > total - done) {
+            nbytes = static_cast<size_t>(total - done);
+        }
+        if (nbytes == 0) {
+            std::fprintf(stderr, "\nFAIL: clear range made no progress\n");
+            return false;
+        }
+        hipError_t err = hipMemset(ptr, 0, nbytes);
+        if (err != hipSuccess) {
+            std::fprintf(stderr, "\nFAIL: hipMemset (%s): %s\n", format_bytes(nbytes).c_str(), hipGetErrorString(err));
+            hip_clear_error();
+            return false;
+        }
+        done += nbytes;
+        print_progress("clear VRAM dst", done, total);
+    }
+    return true;
+}
+
+bool copy_device_range(const std::vector<Block>& blocks, uint64_t src_begin, uint64_t dst_begin, uint64_t bytes) {
+    uint64_t done = 0;
+    print_progress("VRAM -> VRAM", 0, bytes);
+    while (done < bytes) {
+        uint8_t* src = nullptr;
+        uint8_t* dst = nullptr;
+        size_t src_room = 0;
+        size_t dst_room = 0;
+        if (!locate_span(blocks, src_begin + done, &src, &src_room) ||
+            !locate_span(blocks, dst_begin + done, &dst, &dst_room)) {
+            std::fprintf(stderr, "\nFAIL: VRAM copy range is outside the allocation\n");
+            return false;
+        }
+        size_t nbytes = std::min(src_room, dst_room);
+        if (static_cast<uint64_t>(nbytes) > bytes - done) {
+            nbytes = static_cast<size_t>(bytes - done);
+        }
+        if (nbytes == 0) {
+            std::fprintf(stderr, "\nFAIL: VRAM copy made no progress\n");
+            return false;
+        }
+        hipError_t err = hipMemcpy(dst, src, nbytes, hipMemcpyDeviceToDevice);
+        if (err != hipSuccess) {
+            std::fprintf(stderr,
+                         "\nFAIL: hipMemcpy (D2D, %s): %s\n",
+                         format_bytes(nbytes).c_str(),
+                         hipGetErrorString(err));
+            hip_clear_error();
+            return false;
+        }
+        done += nbytes;
+        print_progress("VRAM -> VRAM", done, bytes);
+    }
+    return true;
+}
+
+bool check_device_range(const std::vector<Block>& blocks,
+                        uint64_t seed,
+                        uint8_t* host,
+                        size_t chunk,
+                        uint64_t begin,
+                        uint64_t end,
+                        uint64_t source_base,
+                        Mismatch* mismatch) {
+    const uint64_t total = end - begin;
+    uint64_t done = 0;
+    print_progress("VRAM copy check", 0, total);
+    auto* words = reinterpret_cast<uint64_t*>(host);
+    while (done < total) {
+        uint8_t* device_at = nullptr;
+        size_t room = 0;
+        if (!locate_span(blocks, begin + done, &device_at, &room)) {
+            std::fprintf(stderr, "\nFAIL: VRAM check range is outside the allocation\n");
+            return false;
+        }
+        size_t nbytes = std::min(room, chunk);
+        if (static_cast<uint64_t>(nbytes) > total - done) {
+            nbytes = static_cast<size_t>(total - done);
+        }
+        nbytes &= ~(sizeof(uint64_t) - 1);
+        if (nbytes == 0) {
+            std::fprintf(stderr, "\nFAIL: VRAM check range made no progress\n");
+            return false;
+        }
+        std::memset(host, 0, nbytes);
+        if (!move_chunk(false, device_at, host, nbytes)) {
+            return false;
+        }
+        const uint64_t logical = begin + done;
+        const uint64_t base_word = (logical - source_base) / sizeof(uint64_t);
+        if (auto hit = parallel_check(words, nbytes / sizeof(uint64_t), seed, base_word)) {
+            mismatch->found = true;
+            mismatch->offset = logical + static_cast<uint64_t>(hit->index) * sizeof(uint64_t);
+            mismatch->expected = hit->expected;
+            mismatch->actual = hit->actual;
+            std::printf("\n");
+            return false;
+        }
+        done += nbytes;
+        print_progress("VRAM copy check", done, total);
+    }
+    return true;
+}
+
 struct Staging {
     uint8_t* ptr = nullptr;
     bool pinned = false;
@@ -729,12 +860,69 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
     const double h2d = std::chrono::duration<double>(t1 - t0).count();
     const double d2h = std::chrono::duration<double>(t2 - t1).count();
     const double gib = static_cast<double>(allocated) / (1024.0 * 1024.0 * 1024.0);
-    std::printf("round %d: PASS  (H2D %.1f s, %.2f GiB/s / D2H check %.1f s, %.2f GiB/s)\n",
+    std::printf("round %d host copy: PASS  (H2D %.1f s, %.2f GiB/s / D2H check %.1f s, %.2f GiB/s)\n",
                 round,
                 h2d,
                 h2d > 0 ? gib / h2d : 0,
                 d2h,
                 d2h > 0 ? gib / d2h : 0);
+
+    const uint64_t half = (static_cast<uint64_t>(allocated) / 2) & ~uint64_t{7};
+    if (half < sizeof(uint64_t)) {
+        std::fprintf(stderr, "FAIL: round %d allocated region is too small to split\n", round);
+        return false;
+    }
+    std::printf("VRAM copy: %s from offset 0 to offset %s\n",
+                format_bytes(half).c_str(),
+                format_bytes(half).c_str());
+
+    const auto t3 = std::chrono::steady_clock::now();
+    if (!zero_device_range(blocks, half, half + half)) {
+        std::fprintf(stderr, "FAIL: round %d could not clear the VRAM destination\n", round);
+        return false;
+    }
+    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize")) {
+        return false;
+    }
+    const auto t4 = std::chrono::steady_clock::now();
+    if (!copy_device_range(blocks, 0, half, half)) {
+        std::fprintf(stderr, "FAIL: round %d VRAM-to-VRAM copy failed\n", round);
+        return false;
+    }
+    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize")) {
+        return false;
+    }
+    const auto t5 = std::chrono::steady_clock::now();
+    Mismatch copy_mismatch;
+    if (!check_device_range(blocks, seed, staging.ptr, chunk, half, half + half, half, &copy_mismatch)) {
+        if (copy_mismatch.found) {
+            std::fprintf(stderr,
+                         "FAIL: round %d VRAM copy mismatch at offset %llu (source offset %llu) "
+                         "expected 0x%016llx actual 0x%016llx\n",
+                         round,
+                         static_cast<unsigned long long>(copy_mismatch.offset),
+                         static_cast<unsigned long long>(copy_mismatch.offset - half),
+                         static_cast<unsigned long long>(copy_mismatch.expected),
+                         static_cast<unsigned long long>(copy_mismatch.actual));
+        } else {
+            std::fprintf(stderr, "FAIL: round %d VRAM copy readback failed\n", round);
+        }
+        return false;
+    }
+    const auto t6 = std::chrono::steady_clock::now();
+
+    const double clear_s = std::chrono::duration<double>(t4 - t3).count();
+    const double d2d = std::chrono::duration<double>(t5 - t4).count();
+    const double d2d_check = std::chrono::duration<double>(t6 - t5).count();
+    const double half_gib = static_cast<double>(half) / (1024.0 * 1024.0 * 1024.0);
+    std::printf(
+        "round %d VRAM copy: PASS  (clear %.3f s / D2D %.3f s, %.2f GiB/s / check %.1f s, %.2f GiB/s)\n",
+        round,
+        clear_s,
+        d2d,
+        d2d > 0 ? half_gib / d2d : 0,
+        d2d_check,
+        d2d_check > 0 ? half_gib / d2d_check : 0);
     return true;
 }
 
