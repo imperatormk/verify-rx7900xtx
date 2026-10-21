@@ -4,6 +4,18 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 16:12:49 — Record GPU temperatures and show the thresholds
+
+- Each round records edge, junction, and mem at the start and after the copies, in millidegrees Celsius, with critical and emergency limits
+- `vram-view` draws a meter per sensor. `┃` is critical and the right end is emergency. A reading past a limit is marked on the meter and in the text
+- Temperature does not change pass or fail
+
+## 2026-10-21 15:52:06 — Add a terminal viewer for the JSON log
+
+- `vram-view` draws a JSON log with allocation meters and bandwidth charts
+- `make view` shows the newest log. `LOG=` selects a file. `--plain` turns color off
+- `README.md` and `doc/design.md` describe the viewer
+
 ## 2026-10-21 15:38:34 — Replace the JSON log after every round
 
 - After each round, write the rounds finished so far to a temporary file and `rename` it over the JSON log

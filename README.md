@@ -31,6 +31,18 @@ make clean
 
 Each run also writes `vram-test-YYYYMMDD-HHMMSS.json` in the current directory. After every round the file is replaced with the JSON for the rounds finished so far, with `result` set to `"in_progress"`. The final replacement sets `result` to `"passed"` or `"failed"` and adds `exit_code`. Progress stays on the terminal. `make clean` does not delete the log.
 
+## View a log
+
+`vram-view` prints one JSON log as a terminal report: device and memory, a bar chart of host and VRAM bandwidth, one meter per copy, and the GPU temperature sensors. On each temperature meter, `┃` is critical and the right end is emergency. A reading past emergency extends the meter past that mark. Temperature does not change pass or fail.
+
+```bash
+make view                        # newest vram-test-*.json
+make view LOG=vram-test-20261021-153843.json
+./vram-view --plain file.json
+```
+
+Color is used when stdout is a terminal, unless `NO_COLOR` is set. `--plain` turns color off. `--width N` sets the report width.
+
 | Exit code | Meaning |
 |-----------|---------|
 | 0 | Every round passed |

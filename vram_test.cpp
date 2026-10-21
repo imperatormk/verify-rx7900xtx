@@ -370,6 +370,110 @@ std::string sysfs_device_path(const std::string& pci) {
     return found;
 }
 
+struct TempReading {
+    std::string name;
+    int64_t millicelsius = 0;
+    bool have_critical = false;
+    int64_t critical_millicelsius = 0;
+    bool have_emergency = false;
+    int64_t emergency_millicelsius = 0;
+};
+
+bool read_text_line(const std::string& path, std::string* out) {
+    std::ifstream in(path);
+    if (!in) {
+        return false;
+    }
+    std::string line;
+    if (!std::getline(in, line)) {
+        return false;
+    }
+    while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) {
+        line.pop_back();
+    }
+    if (line.empty()) {
+        return false;
+    }
+    *out = line;
+    return true;
+}
+
+// hwmonN is not stable across boots. Find the amdgpu node under this device.
+std::string find_amdgpu_hwmon(const std::string& device_path) {
+    if (device_path.empty()) {
+        return {};
+    }
+    const std::string dir_path = device_path + "/hwmon";
+    DIR* dir = opendir(dir_path.c_str());
+    if (dir == nullptr) {
+        return {};
+    }
+    std::string found;
+    while (dirent* de = readdir(dir)) {
+        const std::string name = de->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+        const std::string node = dir_path + "/" + name;
+        std::string kind;
+        if (read_text_line(node + "/name", &kind) && kind == "amdgpu") {
+            found = node;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+std::vector<TempReading> read_temperatures(const std::string& hwmon_path) {
+    std::vector<TempReading> out;
+    if (hwmon_path.empty()) {
+        return out;
+    }
+    for (int index = 1; index <= 32; ++index) {
+        const std::string stem = hwmon_path + "/temp" + std::to_string(index);
+        uint64_t milli = 0;
+        if (!read_u64_file(stem + "_input", &milli)) {
+            break;
+        }
+        TempReading reading;
+        if (!read_text_line(stem + "_label", &reading.name)) {
+            reading.name = "temp" + std::to_string(index);
+        }
+        reading.millicelsius = static_cast<int64_t>(milli);
+        uint64_t limit = 0;
+        if (read_u64_file(stem + "_crit", &limit)) {
+            reading.have_critical = true;
+            reading.critical_millicelsius = static_cast<int64_t>(limit);
+        }
+        if (read_u64_file(stem + "_emergency", &limit)) {
+            reading.have_emergency = true;
+            reading.emergency_millicelsius = static_cast<int64_t>(limit);
+        }
+        out.push_back(std::move(reading));
+    }
+    return out;
+}
+
+std::string format_temp_c(int64_t millicelsius) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f C", static_cast<double>(millicelsius) / 1000.0);
+    return buf;
+}
+
+std::string format_temp_list(const std::vector<TempReading>& readings) {
+    std::string out;
+    for (const TempReading& reading : readings) {
+        if (!out.empty()) {
+            out += "   ";
+        }
+        out += reading.name;
+        out += " ";
+        out += format_temp_c(reading.millicelsius);
+    }
+    return out;
+}
+
 bool read_sysfs_vram(const std::string& device_path, SysfsVram* out) {
     out->ok = false;
     if (device_path.empty()) {
@@ -775,6 +879,8 @@ struct RoundRecord {
     uint64_t expected = 0;
     uint64_t actual = 0;
     std::string fail;
+    std::vector<TempReading> temp_before;
+    std::vector<TempReading> temp_after;
 };
 
 std::string json_escape(const std::string& text) {
@@ -1031,6 +1137,61 @@ struct Report {
         }
     }
 
+    const TempReading* find_temp(const std::vector<TempReading>& readings, const std::string& name) const {
+        for (const TempReading& reading : readings) {
+            if (reading.name == name) {
+                return &reading;
+            }
+        }
+        return nullptr;
+    }
+
+    void write_temperature(const RoundRecord& rec) {
+        std::vector<std::string> names;
+        auto add_names = [&names](const std::vector<TempReading>& readings) {
+            for (const TempReading& reading : readings) {
+                bool seen = false;
+                for (const std::string& name : names) {
+                    if (name == reading.name) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    names.push_back(reading.name);
+                }
+            }
+        };
+        add_names(rec.temp_before);
+        add_names(rec.temp_after);
+        std::fprintf(fp, ",\n      \"temperature\": [");
+        for (size_t i = 0; i < names.size(); ++i) {
+            const TempReading* before = find_temp(rec.temp_before, names[i]);
+            const TempReading* after = find_temp(rec.temp_after, names[i]);
+            const TempReading* limits = after != nullptr ? after : before;
+            std::fprintf(fp, "\n        {\n          \"name\": ");
+            json_string(fp, names[i]);
+            if (before != nullptr) {
+                std::fprintf(fp, ",\n          \"before_millicelsius\": %lld", static_cast<long long>(before->millicelsius));
+            }
+            if (after != nullptr) {
+                std::fprintf(fp, ",\n          \"after_millicelsius\": %lld", static_cast<long long>(after->millicelsius));
+            }
+            if (limits != nullptr && limits->have_critical) {
+                std::fprintf(fp,
+                             ",\n          \"critical_millicelsius\": %lld",
+                             static_cast<long long>(limits->critical_millicelsius));
+            }
+            if (limits != nullptr && limits->have_emergency) {
+                std::fprintf(fp,
+                             ",\n          \"emergency_millicelsius\": %lld",
+                             static_cast<long long>(limits->emergency_millicelsius));
+            }
+            std::fprintf(fp, "\n        }%s", i + 1 == names.size() ? "" : ",");
+        }
+        std::fprintf(fp, "\n      ]");
+    }
+
     void write_test(const RoundRecord& rec, bool last) {
         std::fprintf(fp, "    {\n");
         std::fprintf(fp, "      \"round\": %d", rec.round);
@@ -1067,6 +1228,9 @@ struct Report {
             std::fprintf(fp, ",\n      \"error\": ");
             json_string(fp, rec.fail);
         }
+        if (!rec.temp_before.empty() || !rec.temp_after.empty()) {
+            write_temperature(rec);
+        }
         if (rec.have_mismatch) {
             std::fprintf(fp, ",\n      \"mismatch\": {\n");
             std::fprintf(fp, "        \"offset\": %llu", static_cast<unsigned long long>(rec.mismatch_offset));
@@ -1101,7 +1265,7 @@ struct RoundRecorder {
     }
 };
 
-bool run_round(int round, int rounds, int device, size_t chunk, const std::string& sysfs_path, Report* report) {
+bool run_round(int round, int rounds, int device, size_t chunk, const std::string& sysfs_path, const std::string& hwmon_path, Report* report) {
     RoundRecorder recorded;
     recorded.report = report;
     recorded.rec.round = round;
@@ -1138,9 +1302,27 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                     format_bytes(sysfs_before.total).c_str());
     }
 
+    rec.temp_before = read_temperatures(hwmon_path);
+    if (!rec.temp_before.empty()) {
+        std::printf("temperature before  %s\n", format_temp_list(rec.temp_before).c_str());
+    }
+
     std::vector<Block> blocks;
     Staging staging;
     RoundCleanup cleanup{device, &blocks, &staging, true};
+    struct TempAtEnd {
+        RoundRecord* rec = nullptr;
+        const std::string* hwmon = nullptr;
+        ~TempAtEnd() {
+            if (rec == nullptr || hwmon == nullptr) {
+                return;
+            }
+            rec->temp_after = read_temperatures(*hwmon);
+            if (!rec->temp_after.empty()) {
+                std::printf("temperature after   %s\n", format_temp_list(rec->temp_after).c_str());
+            }
+        }
+    } temp_at_end{&rec, &hwmon_path};
 
     std::printf("allocating VRAM...\n");
     std::fflush(stdout);
@@ -1451,6 +1633,7 @@ int main(int argc, char** argv) {
 
     const std::string pci = pci_bus_id(device);
     const std::string sysfs_path = sysfs_device_path(pci);
+    const std::string hwmon_path = find_amdgpu_hwmon(sysfs_path);
     SysfsVram sysfs{};
     read_sysfs_vram(sysfs_path, &sysfs);
 
@@ -1472,6 +1655,25 @@ int main(int argc, char** argv) {
         std::printf("sysfs VRAM: used %s / total %s\n",
                     format_bytes(sysfs.used).c_str(),
                     format_bytes(sysfs.total).c_str());
+    }
+    const std::vector<TempReading> sensors = read_temperatures(hwmon_path);
+    if (sensors.empty()) {
+        std::printf("temperature: sensors not available\n");
+    } else {
+        std::string limits;
+        for (const TempReading& sensor : sensors) {
+            if (!limits.empty()) {
+                limits += "; ";
+            }
+            limits += sensor.name;
+            if (sensor.have_critical) {
+                limits += " critical " + format_temp_c(sensor.critical_millicelsius);
+            }
+            if (sensor.have_emergency) {
+                limits += " emergency " + format_temp_c(sensor.emergency_millicelsius);
+            }
+        }
+        std::printf("temperature: %s\n", limits.c_str());
     }
     std::printf("host memory: total %s / available %s\n",
                 format_bytes(mem_total).c_str(),
@@ -1508,7 +1710,7 @@ int main(int argc, char** argv) {
 
     ran = true;
     for (int round = 1; round <= rounds; ++round) {
-        if (!run_round(round, rounds, device, chunk, sysfs_path, &report)) {
+        if (!run_round(round, rounds, device, chunk, sysfs_path, hwmon_path, &report)) {
             ++failed;
         }
         report.publish_progress();

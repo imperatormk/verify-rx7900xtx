@@ -14,8 +14,10 @@ The target device is the HIP device whose name contains `7900 XTX`. Its architec
 |------|-------------|
 | `README.md` | Short usage guide. This document is the full specification |
 | `vram_test.cpp` | VRAM test |
-| `vram-test` | Binary produced by `make build` |
-| `Makefile` | Build and `make run` |
+| `vram-test` | Test binary produced by `make build` |
+| `vram_view.cpp` | Terminal viewer for a JSON log |
+| `vram-view` | Viewer binary produced by `make build` |
+| `Makefile` | Build, `make run`, and `make view` |
 | `doc/design.md` | This design specification |
 | `doc/ChangeLog.md` | Change history |
 
@@ -23,9 +25,11 @@ The target device is the HIP device whose name contains `7900 XTX`. Its architec
 
 ```bash
 make run                         # build and run 10 rounds (default goal)
-make build                       # build vram-test
+make build                       # build vram-test and vram-view
 make run ROUNDS=10 CHUNK_MIB=256
-make clean                       # remove vram-test and gpucore.*
+make view                        # show the newest JSON log
+make view LOG=vram-test-20261021-153843.json
+make clean                       # remove the binaries, gpucore.*, and a leftover .json.tmp
 ```
 
 | Variable | Default | Description |
@@ -104,3 +108,9 @@ Stdout reports the device name, VRAM total and free sizes, host memory total and
 The same run writes `vram-test-YYYYMMDD-HHMMSS.json` in the current directory. The name uses the local time at start. The file is one JSON object and omits progress lines. It records the time, hostname, kernel, HIP version, device name, architecture, PCI address, VRAM and host memory sizes in bytes, the round count, and the chunk size. `tests` is an array of round objects. A passing round has `result` `"pass"`, the seed as a hex string, the allocated size, free memory after allocation, and `host` and `vram` objects with seconds and GiB/s. A failing round has `result` `"fail"`, an `error` string, and, when bytes differ, a `mismatch` object with `offset`, `expected`, and `actual`. A VRAM-copy mismatch also has `source_offset`. Pattern words are hex strings because a JSON number cannot hold every 64-bit value. The object ends with `passed`, `failed`, and `result`.
 
 After each round the program writes that object, including only the rounds finished so far, to `vram-test-YYYYMMDD-HHMMSS.json.tmp` in the same directory, flushes it, and `rename`s it over the destination. `result` is `"in_progress"` and `exit_code` is omitted. When every round has finished, or when setup fails before the first round, one more replacement sets `result` to `"passed"`, `"failed"`, or `"setup_failed"` and adds `exit_code`. A reader therefore sees either the previous complete document or the new one. `make clean` deletes a leftover temporary file and leaves the JSON log in place.
+
+Each round also reads the GPU temperature sensors from the `amdgpu` hwmon node under the same sysfs device. The hwmon directory name is not fixed, so the test selects the node whose `name` file is `amdgpu`. It records every `tempN_input` with its `tempN_label`, plus `tempN_crit` and `tempN_emergency` when those files exist. Values are integers in millidegrees Celsius. The test reads them at the start of the round and again after the copies, including when the round fails. On this GPU the labels are `edge`, `junction`, and `mem`. A missing sensor file omits that field. Temperature does not change the pass or fail result.
+
+In the round object, `temperature` is an array. Each element has `name`, `before_millicelsius`, `after_millicelsius` when that sample exists, and `critical_millicelsius` and `emergency_millicelsius` when the driver publishes them.
+
+`vram-view` reads one of these files and draws it for a person. With no file argument it picks the newest `vram-test-*.json` in the current directory. The report shows the device, how much of VRAM the run allocated, host memory in use, and the copy rates. Host transfers (`host → vram`, `vram → host`, and the VRAM-copy readback) share one vertical chart and one meter scale. The `vram → vram` rate uses a separate, higher scale. A failing round prints its `error` and, when present, the mismatch offset and the expected and actual words. For each temperature sensor it draws a meter from 0°C to emergency. `┃` marks critical and the right end marks emergency. The line also states the gap, such as `54.0°C under critical`. At or above critical the filled part turns red, the part above critical uses a second glyph, and the line says `OVER critical by`. At or above emergency the scale grows to the reading so the overflow is drawn past an interior emergency mark, and the line says `OVER emergency by`. A log with no `temperature` array omits the meters. `--plain` disables color. Color is otherwise on when stdout is a terminal and `NO_COLOR` is unset.
