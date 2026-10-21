@@ -31,6 +31,20 @@ make clean
 
 Each run also writes `vram-test-YYYYMMDD-HHMMSS.json` in the current directory. After every round the file is replaced with the JSON for the rounds finished so far, with `result` set to `"in_progress"`. The final replacement sets `result` to `"passed"` or `"failed"` and adds `exit_code`. Progress stays on the terminal. `make clean` does not delete the log.
 
+## Limitations
+
+The test calls the HIP host API only (`hipMalloc`, `hipMemset`, and `hipMemcpy`). It does not launch a device kernel. A mismatch or a HIP error shows that the copy path failed. It does not show whether the fault is in HIP or in a layer below it: the kernel driver, firmware, PCIe, the copy engine, or VRAM. The host check and the VRAM check name different copies. They do not name the layer.
+
+A pass means the recorded bytes matched the seed pattern on those rounds. The test does not detect:
+
+- Faults in compute units, shaders, or matrix instructions
+- Cache behavior that appears only while a kernel is running
+- Corrected ECC errors that leave the final bytes unchanged
+- Engines other than this host and VRAM copy path
+- Faults rarer than the rounds in the run, or the same checks with other seeds, chunk sizes, or devices
+- Temperature during a copy. Sensors are read only before the round and after the copies, and temperature does not change pass or fail
+- Power, clocks, fan speed, or device error counters
+
 ## View a log
 
 `vram-view` prints one JSON log as a terminal report: device and memory, a bar chart of host and VRAM bandwidth, one meter per copy, and the GPU temperature sensors. At the end of the report, line charts plot host bandwidth (`host → vram`, `vram → host`, and readback), VRAM copy bandwidth, and each temperature sensor across the rounds. A dashed line marks critical on the temperature chart. An O/X table then lists the host check, the VRAM check, and the round. It wraps by whole columns. The last section is a Summary: the machine, the method, whether the run found a problem, and what the log does and does not establish. It ends by stating that a failure cannot be assigned to HIP or to a layer below it. On each temperature meter, `┃` is critical and the right end is emergency. A reading past emergency extends the meter past that mark. Temperature does not change pass or fail.
