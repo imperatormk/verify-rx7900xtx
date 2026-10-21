@@ -4,6 +4,12 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 19:46:16 — Report CPU-visible VRAM and the PCI BAR 0 size
+
+- At startup `vram-test` reads sysfs `mem_info_vis_vram_total` and the size of PCI BAR 0, prints them, and warns when the CPU-visible size is below VRAM (Resizable BAR not active)
+- The JSON log gains `cpu_visible_vram_bytes`, `large_bar` and `pci_bar0_bytes`. Pass and fail are unchanged: the copy test does not use the BAR window
+- `doc/bar-check.md` explains the check, records the data from a 256 MiB BAR host, and gives the BIOS fix
+
 ## 2026-10-21 18:40:56 — State the layer limit at the end of the Summary
 
 - The Summary ends by stating that a mismatch or a HIP error cannot separate a HIP fault from the kernel driver, firmware, PCIe, the copy engine, or VRAM

@@ -68,6 +68,10 @@ struct SysfsVram {
     bool ok = false;
     uint64_t used = 0;
     uint64_t total = 0;
+    // CPU-visible part of VRAM (mem_info_vis_vram_total): the PCI BAR window. It is smaller than
+    // total when Resizable BAR is off. The copy test below does not need it, so it cannot fail on it.
+    bool have_visible = false;
+    uint64_t visible = 0;
 };
 
 // SplitMix64 finalizer. The word depends only on the seed and the word index.
@@ -488,6 +492,32 @@ bool read_sysfs_vram(const std::string& device_path, SysfsVram* out) {
     out->ok = true;
     out->used = used;
     out->total = total;
+    uint64_t visible = 0;
+    if (read_u64_file(device_path + "/mem_info_vis_vram_total", &visible)) {
+        out->have_visible = true;
+        out->visible = visible;
+    }
+    return true;
+}
+
+// Size of PCI BAR 0, the GPU's VRAM aperture, from the first line of <device>/resource
+// ("start end flags" in hex). 256 MiB means Resizable BAR is not active.
+bool read_bar0_bytes(const std::string& device_path, uint64_t* out) {
+    if (device_path.empty()) {
+        return false;
+    }
+    std::ifstream in(device_path + "/resource");
+    std::string start_text;
+    std::string end_text;
+    if (!(in >> start_text >> end_text)) {
+        return false;
+    }
+    const uint64_t start = std::strtoull(start_text.c_str(), nullptr, 16);
+    const uint64_t end = std::strtoull(end_text.c_str(), nullptr, 16);
+    if (end <= start) {
+        return false;
+    }
+    *out = end - start + 1;
     return true;
 }
 
@@ -945,6 +975,11 @@ struct Report {
     uint64_t vram_total_bytes = 0;
     bool have_vram_free = false;
     uint64_t vram_free_bytes = 0;
+    bool have_cpu_visible = false;
+    uint64_t cpu_visible_bytes = 0;
+    uint64_t sysfs_vram_total_bytes = 0;
+    bool have_bar0 = false;
+    uint64_t bar0_bytes = 0;
     bool have_host_memory = false;
     uint64_t host_memory_bytes = 0;
     bool have_host_available = false;
@@ -1057,6 +1092,13 @@ struct Report {
         }
         if (have_vram_free) {
             std::fprintf(fp, "  \"vram_free_bytes\": %llu,\n", static_cast<unsigned long long>(vram_free_bytes));
+        }
+        if (have_cpu_visible) {
+            std::fprintf(fp, "  \"cpu_visible_vram_bytes\": %llu,\n", static_cast<unsigned long long>(cpu_visible_bytes));
+            std::fprintf(fp, "  \"large_bar\": %s,\n", cpu_visible_bytes >= sysfs_vram_total_bytes ? "true" : "false");
+        }
+        if (have_bar0) {
+            std::fprintf(fp, "  \"pci_bar0_bytes\": %llu,\n", static_cast<unsigned long long>(bar0_bytes));
         }
         if (have_host_memory) {
             std::fprintf(fp, "  \"host_memory_bytes\": %llu,\n", static_cast<unsigned long long>(host_memory_bytes));
@@ -1656,6 +1698,22 @@ int main(int argc, char** argv) {
                     format_bytes(sysfs.used).c_str(),
                     format_bytes(sysfs.total).c_str());
     }
+    uint64_t bar0 = 0;
+    const bool have_bar0 = read_bar0_bytes(sysfs_path, &bar0);
+    if (sysfs.ok && sysfs.have_visible) {
+        std::printf("CPU-visible VRAM: %s of %s%s%s\n",
+                    format_bytes(sysfs.visible).c_str(),
+                    format_bytes(sysfs.total).c_str(),
+                    have_bar0 ? ", PCI BAR 0 " : "",
+                    have_bar0 ? format_bytes(bar0).c_str() : "");
+        if (sysfs.visible < sysfs.total) {
+            std::printf("WARNING: only %s of VRAM is CPU-visible: Resizable BAR is not active.\n"
+                        "         Enable \"Above 4G Decoding\" and \"Re-Size BAR Support\" in the BIOS (CSM off).\n"
+                        "         This copy test still passes; software that maps VRAM into the host fails.\n"
+                        "         See doc/bar-check.md.\n",
+                        format_bytes(sysfs.visible).c_str());
+        }
+    }
     const std::vector<TempReading> sensors = read_temperatures(hwmon_path);
     if (sensors.empty()) {
         std::printf("temperature: sensors not available\n");
@@ -1690,6 +1748,11 @@ int main(int argc, char** argv) {
     report.vram_total_bytes = prop.totalGlobalMem;
     report.have_vram_free = true;
     report.vram_free_bytes = free_bytes;
+    report.have_cpu_visible = sysfs.ok && sysfs.have_visible;
+    report.cpu_visible_bytes = sysfs.visible;
+    report.sysfs_vram_total_bytes = sysfs.total;
+    report.have_bar0 = have_bar0;
+    report.bar0_bytes = bar0;
     report.have_host_memory = true;
     report.host_memory_bytes = mem_total;
     report.have_host_available = true;

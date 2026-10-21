@@ -46,7 +46,8 @@ The only dependency is the ROCm HIP runtime (`libamdhip64`). There is no device 
 ## One round
 
 1. **Read the capacity.**  
-   Print `totalGlobalMem` from `hipGetDeviceProperties`, and the free and total sizes from `hipMemGetInfo`. Also read sysfs `mem_info_vram_total` and `mem_info_vram_used` from the `/sys/class/drm/cardN/device` directory whose PCI bus ID matches the GPU.
+   Print `totalGlobalMem` from `hipGetDeviceProperties`, and the free and total sizes from `hipMemGetInfo`. Also read sysfs `mem_info_vram_total` and `mem_info_vram_used` from the `/sys/class/drm/cardN/device` directory whose PCI bus ID matches the GPU.  
+   At startup only, also read `mem_info_vis_vram_total` (the CPU-visible part of VRAM) from the same directory and the size of PCI BAR 0 from the first line of its `resource` file, and print both. When the CPU-visible size is below `mem_info_vram_total`, print a warning that Resizable BAR is not active. The JSON log records `cpu_visible_vram_bytes`, `large_bar` and `pci_bar0_bytes`. This does not change pass or fail. See `bar-check.md`.
 
 2. **Copy until VRAM is full.**  
    Call `hipMalloc` against free VRAM, at most 1 GiB per allocation. On failure, shrink the request by 64 MiB and retry. Copy from the host into each block with `hipMemcpyHostToDevice` in `CHUNK_MIB` units (256 MiB by default).

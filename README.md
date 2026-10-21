@@ -19,6 +19,10 @@ make clean
 | `ROUNDS` | 10 | Number of rounds |
 | `CHUNK_MIB` | 256 | Host staging buffer size, in MiB |
 
+## CPU-visible VRAM
+
+At startup the test also reports how much VRAM the CPU can map (sysfs `mem_info_vis_vram_total`) and the size of PCI BAR 0. When it is smaller than VRAM, Resizable BAR is not active: the test prints a warning and writes `"large_bar": false`, `cpu_visible_vram_bytes` and `pci_bar0_bytes` to the JSON log. The copy test itself still passes on such a host, because `hipMemcpy` does not use that window. See [`doc/bar-check.md`](doc/bar-check.md) for diagnosis and the BIOS fix.
+
 ## One round
 
 1. Read the VRAM capacity.
@@ -44,6 +48,7 @@ A pass means the recorded bytes matched the seed pattern on those rounds. The te
 - Faults rarer than the rounds in the run, or the same checks with other seeds, chunk sizes, or devices
 - Temperature during a copy. Sensors are read only before the round and after the copies, and temperature does not change pass or fail
 - Power, clocks, fan speed, or device error counters
+- Host access to VRAM through the PCI BAR. A host with a 256 MiB BAR (Resizable BAR off) passes; the startup report and `large_bar` in the log show it
 
 ## View a log
 
