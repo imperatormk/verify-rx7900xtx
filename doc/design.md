@@ -12,6 +12,7 @@ The target device is the HIP device whose name contains `7900 XTX`. Its architec
 
 | File | Description |
 |------|-------------|
+| `README.md` | Short usage guide. This document is the full specification |
 | `vram_test.cpp` | VRAM test |
 | `vram-test` | Binary produced by `make build` |
 | `Makefile` | Build and `make run` |

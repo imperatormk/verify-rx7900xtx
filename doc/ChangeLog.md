@@ -4,6 +4,11 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 13:57:35 — Add a short README
+
+- Added `README.md` with a short version of the usage and the per-round check
+- Listed `README.md` in `doc/design.md`. The full procedure stays in that document
+
 ## 2026-10-21 13:54:07 — Use English for all repository text
 
 - Rewrote user-facing messages, comments, `doc/design.md`, and this history in English
