@@ -1,2 +1,3 @@
 vram-test
+vram-test-*.log
 gpucore.*

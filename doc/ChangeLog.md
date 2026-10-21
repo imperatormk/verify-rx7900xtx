@@ -4,6 +4,12 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 14:52:10 — Write a compact result log
+
+- Each run writes `vram-test-YYYYMMDD-HHMMSS.log` with the host, GPU, one line per round, and the final result
+- Progress stays on the terminal. `make clean` does not delete the log
+- `README.md` and `doc/design.md` describe the file
+
 ## 2026-10-21 14:25:24 — Add a VRAM-to-VRAM copy check
 
 - After the host copy check, each round clears the second half of the allocation and copies the first half onto it with `hipMemcpyDeviceToDevice`

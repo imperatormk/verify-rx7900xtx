@@ -8,20 +8,25 @@
 // the second half with hipMemcpyDeviceToDevice and checked the same way.
 
 #include <hip/hip_runtime_api.h>
+#include <hip/hip_version.h>
 
 #include <sys/random.h>
 #include <unistd.h>
 
 #include <dirent.h>
 
+#include <sys/utsname.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -163,28 +168,34 @@ void hip_clear_error() {
     (void)hipGetLastError();
 }
 
-bool hip_ok(hipError_t err, const char* what) {
+bool hip_ok(hipError_t err, const char* what, std::string* detail = nullptr) {
     if (err == hipSuccess) {
         return true;
     }
-    std::fprintf(stderr, "FAIL: %s: %s\n", what, hipGetErrorString(err));
+    const char* msg = hipGetErrorString(err);
+    std::fprintf(stderr, "FAIL: %s: %s\n", what, msg);
+    if (detail != nullptr) {
+        *detail = std::string(what) + ": " + msg;
+    }
     hip_clear_error();
     return false;
 }
 
-uint64_t random_seed() {
+bool random_seed(uint64_t* out) {
     uint64_t seed = 0;
     ssize_t n = getrandom(&seed, sizeof seed, 0);
     if (n == static_cast<ssize_t>(sizeof seed)) {
-        return seed;
+        *out = seed;
+        return true;
     }
     std::ifstream in("/dev/urandom", std::ios::binary);
     in.read(reinterpret_cast<char*>(&seed), sizeof seed);
     if (!in) {
         std::fprintf(stderr, "FAIL: could not read a random seed\n");
-        std::exit(2);
+        return false;
     }
-    return seed;
+    *out = seed;
+    return true;
 }
 
 unsigned thread_count(size_t words) {
@@ -740,20 +751,168 @@ bool within_leftover(uint64_t gap) {
     return gap <= kMaxLeftover;
 }
 
-bool run_round(int round, int rounds, int device, size_t chunk, const std::string& sysfs_path) {
+struct RoundRecord {
+    int round = 0;
+    bool have_seed = false;
+    uint64_t seed = 0;
+    bool have_alloc = false;
+    uint64_t allocated = 0;
+    uint64_t free_after = 0;
+    bool host_pass = false;
+    double h2d_s = 0;
+    double h2d_rate = 0;
+    double d2h_s = 0;
+    double d2h_rate = 0;
+    bool vram_pass = false;
+    double clear_s = 0;
+    double d2d_s = 0;
+    double d2d_rate = 0;
+    double check_s = 0;
+    double check_rate = 0;
+    std::string fail;
+};
+
+struct Report {
+    FILE* fp = nullptr;
+    std::string path;
+
+    ~Report() {
+        if (fp != nullptr) {
+            std::fclose(fp);
+            fp = nullptr;
+        }
+    }
+
+    bool open() {
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_r(&now, &local);
+        char name[64];
+        std::snprintf(name,
+                      sizeof name,
+                      "vram-test-%04d%02d%02d-%02d%02d%02d.log",
+                      local.tm_year + 1900,
+                      local.tm_mon + 1,
+                      local.tm_mday,
+                      local.tm_hour,
+                      local.tm_min,
+                      local.tm_sec);
+        path = name;
+        fp = std::fopen(path.c_str(), "w");
+        if (fp == nullptr) {
+            return false;
+        }
+        char when[80];
+        std::snprintf(when,
+                      sizeof when,
+                      "%04d-%02d-%02d %02d:%02d:%02d",
+                      local.tm_year + 1900,
+                      local.tm_mon + 1,
+                      local.tm_mday,
+                      local.tm_hour,
+                      local.tm_min,
+                      local.tm_sec);
+        line("program: verify-rx7900xtx");
+        line("time: %s", when);
+        char host[256] = {};
+        if (gethostname(host, sizeof host - 1) == 0) {
+            line("host: %s", host);
+        }
+        utsname un{};
+        if (uname(&un) == 0) {
+            line("kernel: %s %s", un.sysname, un.release);
+        }
+        line("hip: %d.%d.%d", HIP_VERSION_MAJOR, HIP_VERSION_MINOR, HIP_VERSION_PATCH);
+        return true;
+    }
+
+    void line(const char* fmt, ...) {
+        if (fp == nullptr) {
+            return;
+        }
+        va_list ap;
+        va_start(ap, fmt);
+        std::vfprintf(fp, fmt, ap);
+        va_end(ap);
+        std::fputc('\n', fp);
+        std::fflush(fp);
+    }
+
+    void write_round(const RoundRecord& rec) {
+        if (fp == nullptr) {
+            return;
+        }
+        std::fprintf(fp, "round %d", rec.round);
+        if (rec.have_seed) {
+            std::fprintf(fp, " seed=0x%016llx", static_cast<unsigned long long>(rec.seed));
+        }
+        if (rec.have_alloc) {
+            std::fprintf(fp,
+                         " allocated_bytes=%llu free_after_bytes=%llu",
+                         static_cast<unsigned long long>(rec.allocated),
+                         static_cast<unsigned long long>(rec.free_after));
+        }
+        if (rec.host_pass) {
+            std::fprintf(fp,
+                         " host=PASS h2d=%.1fs %.2fGiB/s d2h=%.1fs %.2fGiB/s",
+                         rec.h2d_s,
+                         rec.h2d_rate,
+                         rec.d2h_s,
+                         rec.d2h_rate);
+        }
+        if (rec.vram_pass) {
+            std::fprintf(fp,
+                         " vram=PASS clear=%.3fs d2d=%.3fs %.2fGiB/s check=%.1fs %.2fGiB/s",
+                         rec.clear_s,
+                         rec.d2d_s,
+                         rec.d2d_rate,
+                         rec.check_s,
+                         rec.check_rate);
+        }
+        if (!rec.fail.empty()) {
+            std::fprintf(fp, " FAIL %s", rec.fail.c_str());
+        }
+        std::fputc('\n', fp);
+        std::fflush(fp);
+    }
+};
+
+struct RoundRecorder {
+    Report* report = nullptr;
+    RoundRecord rec;
+    bool written = false;
+
+    ~RoundRecorder() {
+        if (!written && report != nullptr) {
+            report->write_round(rec);
+        }
+    }
+};
+
+bool run_round(int round, int rounds, int device, size_t chunk, const std::string& sysfs_path, Report* report) {
+    RoundRecorder recorded;
+    recorded.report = report;
+    recorded.rec.round = round;
+    RoundRecord& rec = recorded.rec;
     std::printf("\n--- round %d/%d ---\n", round, rounds);
     std::fflush(stdout);
 
-    if (!hip_ok(hipSetDevice(device), "hipSetDevice")) {
+    if (!hip_ok(hipSetDevice(device), "hipSetDevice", &rec.fail)) {
         return false;
     }
 
-    const uint64_t seed = random_seed();
+    uint64_t seed = 0;
+    if (!random_seed(&seed)) {
+        rec.fail = "could not read a random seed";
+        return false;
+    }
+    rec.have_seed = true;
+    rec.seed = seed;
     std::printf("seed: 0x%016llx\n", static_cast<unsigned long long>(seed));
 
     size_t free_before = 0;
     size_t total = 0;
-    if (!hip_ok(hipMemGetInfo(&free_before, &total), "hipMemGetInfo")) {
+    if (!hip_ok(hipMemGetInfo(&free_before, &total), "hipMemGetInfo", &rec.fail)) {
         return false;
     }
     SysfsVram sysfs_before{};
@@ -782,8 +941,15 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                      round,
                      format_bytes(allocated).c_str(),
                      format_bytes(free_after).c_str());
+        rec.have_alloc = true;
+        rec.allocated = allocated;
+        rec.free_after = free_after;
+        rec.fail = "could not allocate the free VRAM";
         return false;
     }
+    rec.have_alloc = true;
+    rec.allocated = allocated;
+    rec.free_after = free_after;
 
     const uint64_t unallocated =
         free_before > allocated + free_after ? free_before - allocated - free_after : 0;
@@ -799,12 +965,14 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                      format_bytes(free_after).c_str(),
                      format_bytes(unallocated).c_str(),
                      format_bytes(kMaxLeftover).c_str());
+        rec.fail = "did not fill VRAM";
         return false;
     }
 
     SysfsVram sysfs_after{};
     if (!read_sysfs_vram(sysfs_path, &sysfs_after)) {
         std::fprintf(stderr, "FAIL: round %d could not read sysfs VRAM usage\n", round);
+        rec.fail = "could not read sysfs VRAM usage";
         return false;
     }
     // The runtime may reuse VRAM that sysfs still counts as used.
@@ -822,10 +990,12 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                      round,
                      format_bytes(sysfs_after.used).c_str(),
                      format_bytes(sysfs_after.total).c_str());
+        rec.fail = "sysfs usage does not show VRAM exhausted";
         return false;
     }
 
     if (!staging.alloc(chunk)) {
+        rec.fail = "could not allocate the staging buffer";
         return false;
     }
     std::printf("staging: %s (%s)\n",
@@ -836,10 +1006,11 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
     Mismatch mismatch;
     if (!transfer_and_check(blocks, seed, staging.ptr, chunk, true, &mismatch)) {
         std::fprintf(stderr, "FAIL: round %d host-to-VRAM copy failed\n", round);
+        rec.fail = "host-to-VRAM copy failed";
         return false;
     }
     const auto t1 = std::chrono::steady_clock::now();
-    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize")) {
+    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize", &rec.fail)) {
         return false;
     }
     if (!transfer_and_check(blocks, seed, staging.ptr, chunk, false, &mismatch)) {
@@ -850,8 +1021,17 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                          static_cast<unsigned long long>(mismatch.offset),
                          static_cast<unsigned long long>(mismatch.expected),
                          static_cast<unsigned long long>(mismatch.actual));
+            char buf[192];
+            std::snprintf(buf,
+                          sizeof buf,
+                          "host mismatch offset=%llu expected=0x%016llx actual=0x%016llx",
+                          static_cast<unsigned long long>(mismatch.offset),
+                          static_cast<unsigned long long>(mismatch.expected),
+                          static_cast<unsigned long long>(mismatch.actual));
+            rec.fail = buf;
         } else {
             std::fprintf(stderr, "FAIL: round %d VRAM-to-host copy failed\n", round);
+            rec.fail = "VRAM-to-host copy failed";
         }
         return false;
     }
@@ -860,16 +1040,22 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
     const double h2d = std::chrono::duration<double>(t1 - t0).count();
     const double d2h = std::chrono::duration<double>(t2 - t1).count();
     const double gib = static_cast<double>(allocated) / (1024.0 * 1024.0 * 1024.0);
+    rec.host_pass = true;
+    rec.h2d_s = h2d;
+    rec.h2d_rate = h2d > 0 ? gib / h2d : 0;
+    rec.d2h_s = d2h;
+    rec.d2h_rate = d2h > 0 ? gib / d2h : 0;
     std::printf("round %d host copy: PASS  (H2D %.1f s, %.2f GiB/s / D2H check %.1f s, %.2f GiB/s)\n",
                 round,
                 h2d,
-                h2d > 0 ? gib / h2d : 0,
+                rec.h2d_rate,
                 d2h,
-                d2h > 0 ? gib / d2h : 0);
+                rec.d2h_rate);
 
     const uint64_t half = (static_cast<uint64_t>(allocated) / 2) & ~uint64_t{7};
     if (half < sizeof(uint64_t)) {
         std::fprintf(stderr, "FAIL: round %d allocated region is too small to split\n", round);
+        rec.fail = "allocated region is too small to split";
         return false;
     }
     std::printf("VRAM copy: %s from offset 0 to offset %s\n",
@@ -879,17 +1065,19 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
     const auto t3 = std::chrono::steady_clock::now();
     if (!zero_device_range(blocks, half, half + half)) {
         std::fprintf(stderr, "FAIL: round %d could not clear the VRAM destination\n", round);
+        rec.fail = "could not clear the VRAM destination";
         return false;
     }
-    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize")) {
+    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize", &rec.fail)) {
         return false;
     }
     const auto t4 = std::chrono::steady_clock::now();
     if (!copy_device_range(blocks, 0, half, half)) {
         std::fprintf(stderr, "FAIL: round %d VRAM-to-VRAM copy failed\n", round);
+        rec.fail = "VRAM-to-VRAM copy failed";
         return false;
     }
-    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize")) {
+    if (!hip_ok(hipDeviceSynchronize(), "hipDeviceSynchronize", &rec.fail)) {
         return false;
     }
     const auto t5 = std::chrono::steady_clock::now();
@@ -904,8 +1092,18 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
                          static_cast<unsigned long long>(copy_mismatch.offset - half),
                          static_cast<unsigned long long>(copy_mismatch.expected),
                          static_cast<unsigned long long>(copy_mismatch.actual));
+            char buf[256];
+            std::snprintf(buf,
+                          sizeof buf,
+                          "VRAM copy mismatch offset=%llu source_offset=%llu expected=0x%016llx actual=0x%016llx",
+                          static_cast<unsigned long long>(copy_mismatch.offset),
+                          static_cast<unsigned long long>(copy_mismatch.offset - half),
+                          static_cast<unsigned long long>(copy_mismatch.expected),
+                          static_cast<unsigned long long>(copy_mismatch.actual));
+            rec.fail = buf;
         } else {
             std::fprintf(stderr, "FAIL: round %d VRAM copy readback failed\n", round);
+            rec.fail = "VRAM copy readback failed";
         }
         return false;
     }
@@ -923,14 +1121,23 @@ bool run_round(int round, int rounds, int device, size_t chunk, const std::strin
         d2d > 0 ? half_gib / d2d : 0,
         d2d_check,
         d2d_check > 0 ? half_gib / d2d_check : 0);
+    rec.vram_pass = true;
+    rec.clear_s = clear_s;
+    rec.d2d_s = d2d;
+    rec.d2d_rate = d2d > 0 ? half_gib / d2d : 0;
+    rec.check_s = d2d_check;
+    rec.check_rate = d2d_check > 0 ? half_gib / d2d_check : 0;
     return true;
 }
 
-size_t choose_chunk(size_t requested) {
+bool choose_chunk(size_t requested, size_t* chunk_out, std::string* fail) {
     uint64_t available_kb = 0;
     if (!read_meminfo_kb("MemAvailable:", &available_kb)) {
         std::fprintf(stderr, "FAIL: could not read MemAvailable\n");
-        std::exit(2);
+        if (fail != nullptr) {
+            *fail = "could not read MemAvailable";
+        }
+        return false;
     }
     const uint64_t available = available_kb * 1024ull;
     uint64_t limit = available / 4;
@@ -948,9 +1155,13 @@ size_t choose_chunk(size_t requested) {
     }
     if (chunk < (1ull << 20)) {
         std::fprintf(stderr, "FAIL: not enough host memory for the staging buffer\n");
-        std::exit(2);
+        if (fail != nullptr) {
+            *fail = "not enough host memory for the staging buffer";
+        }
+        return false;
     }
-    return chunk;
+    *chunk_out = chunk;
+    return true;
 }
 
 }  // namespace
@@ -981,23 +1192,62 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    Report report;
+    if (!report.open()) {
+        std::fprintf(stderr, "FAIL: could not create the result log\n");
+        return 2;
+    }
+    std::printf("log: %s\n", report.path.c_str());
+
+    int exit_code = 2;
+    int failed = 0;
+    bool ran = false;
+    std::string setup_fail;
+    struct Finish {
+        Report* report = nullptr;
+        int* exit_code = nullptr;
+        int rounds = 0;
+        int* failed = nullptr;
+        bool* ran = nullptr;
+        std::string* setup_fail = nullptr;
+
+        ~Finish() {
+            if (report == nullptr || report->fp == nullptr) {
+                return;
+            }
+            if (!*ran) {
+                report->line("result: setup failed");
+                if (setup_fail != nullptr && !setup_fail->empty()) {
+                    report->line("reason: %s", setup_fail->c_str());
+                }
+            } else if (*failed == 0) {
+                report->line("result: %d/%d passed", rounds, rounds);
+            } else {
+                report->line("result: %d/%d passed, %d failed", rounds - *failed, rounds, *failed);
+            }
+            report->line("exit_code: %d", *exit_code);
+            std::printf("log: %s\n", report->path.c_str());
+        }
+    } finish{&report, &exit_code, rounds, &failed, &ran, &setup_fail};
+
     std::printf("=== VRAM test (RX 7900 XTX) ===\n");
     const int device = find_device();
     if (device < 0) {
-        return 2;
+        setup_fail = "RX 7900 XTX not found";
+        return exit_code;
     }
-    if (!hip_ok(hipSetDevice(device), "hipSetDevice")) {
-        return 2;
+    if (!hip_ok(hipSetDevice(device), "hipSetDevice", &setup_fail)) {
+        return exit_code;
     }
 
     hipDeviceProp_t prop{};
-    if (!hip_ok(hipGetDeviceProperties(&prop, device), "hipGetDeviceProperties")) {
-        return 2;
+    if (!hip_ok(hipGetDeviceProperties(&prop, device), "hipGetDeviceProperties", &setup_fail)) {
+        return exit_code;
     }
     size_t free_bytes = 0;
     size_t total_bytes = 0;
-    if (!hip_ok(hipMemGetInfo(&free_bytes, &total_bytes), "hipMemGetInfo")) {
-        return 2;
+    if (!hip_ok(hipMemGetInfo(&free_bytes, &total_bytes), "hipMemGetInfo", &setup_fail)) {
+        return exit_code;
     }
 
     const std::string pci = pci_bus_id(device);
@@ -1031,16 +1281,30 @@ int main(int argc, char** argv) {
         std::printf("host memory is smaller than VRAM, so the test copies in chunks.\n");
     }
 
-    const size_t chunk = choose_chunk(chunk_mib << 20);
+    report.line("device: %s", prop.name);
+    report.line("arch: %s", prop.gcnArchName);
+    report.line("pci: %s", pci.c_str());
+    report.line("vram_total_bytes: %llu", static_cast<unsigned long long>(prop.totalGlobalMem));
+    report.line("vram_free_bytes: %llu", static_cast<unsigned long long>(free_bytes));
+    report.line("host_memory_bytes: %llu", static_cast<unsigned long long>(mem_total));
+    report.line("host_available_bytes: %llu", static_cast<unsigned long long>(mem_avail));
+    report.line("rounds: %d", rounds);
+
+    size_t chunk = 0;
+    if (!choose_chunk(chunk_mib << 20, &chunk, &setup_fail)) {
+        return exit_code;
+    }
+    report.line("chunk_bytes: %llu", static_cast<unsigned long long>(chunk));
+
     std::printf("rounds: %d  chunk: %s  max leftover: %s\n",
                 rounds,
                 format_bytes(chunk).c_str(),
                 format_bytes(kMaxLeftover).c_str());
     std::fflush(stdout);
 
-    int failed = 0;
+    ran = true;
     for (int round = 1; round <= rounds; ++round) {
-        if (!run_round(round, rounds, device, chunk, sysfs_path)) {
+        if (!run_round(round, rounds, device, chunk, sysfs_path, &report)) {
             ++failed;
         }
     }
@@ -1048,8 +1312,10 @@ int main(int argc, char** argv) {
     std::printf("\nresult: %d/%d passed", rounds - failed, rounds);
     if (failed == 0) {
         std::printf("\n");
-        return 0;
+        exit_code = 0;
+        return exit_code;
     }
     std::printf(", %d failed\n", failed);
-    return 1;
+    exit_code = 1;
+    return exit_code;
 }
