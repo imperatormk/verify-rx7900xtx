@@ -1193,86 +1193,90 @@ void print_temperatures(const Style& style, const std::vector<TempSensor>& senso
     std::cout << "\n";
 }
 
-// Draw each sensor from the first sample of the run to the last.
-// The horizontal axis is round order. Critical limits are dashed lines.
-void print_temperature_history(const Style& style, const Report& report) {
-    struct Series {
-        std::string name;
-        std::vector<double> samples;
-        std::vector<int> rounds;
-        bool have_critical = false;
-        double critical = 0;
-    };
-    std::vector<Series> series;
-    auto find_series = [&series](const std::string& name) -> Series* {
-        for (Series& item : series) {
-            if (item.name == name) {
-                return &item;
-            }
-        }
-        return nullptr;
-    };
-    for (const Round& round : report.tests) {
-        for (const TempSensor& sensor : round.temperature) {
-            Series* dest = find_series(sensor.name);
-            if (dest == nullptr) {
-                series.push_back(Series{});
-                dest = &series.back();
-                dest->name = sensor.name;
-            }
-            if (sensor.have_critical) {
-                dest->have_critical = true;
-                dest->critical = static_cast<double>(sensor.critical_mc) / 1000.0;
-            }
-            if (sensor.have_before) {
-                dest->samples.push_back(static_cast<double>(sensor.before_mc) / 1000.0);
-                dest->rounds.push_back(round.round);
-            }
-            if (sensor.have_after) {
-                dest->samples.push_back(static_cast<double>(sensor.after_mc) / 1000.0);
-                dest->rounds.push_back(round.round);
-            }
-        }
+struct HistorySeries {
+    std::string name;
+    std::vector<double> samples;
+    std::vector<int> rounds;
+    const char* color = kCyan;
+    bool have_critical = false;
+    double critical = 0;
+};
+
+std::string format_axis_value(double value) {
+    char buf[16];
+    if (std::fabs(value) >= 100.0) {
+        std::snprintf(buf, sizeof buf, "%.0f", value);
+    } else {
+        std::snprintf(buf, sizeof buf, "%.1f", value);
     }
-    series.erase(std::remove_if(series.begin(), series.end(), [](const Series& item) { return item.samples.size() < 2; }), series.end());
-    if (series.empty()) {
+    return buf;
+}
+
+// One line per series across the rounds. Critical values, when present, are dashed.
+void draw_history(const Style& style, const char* title, const char* subtitle, const std::vector<HistorySeries>& series, int rows, double min_span) {
+    if (series.empty() || rows < 2) {
         return;
     }
-
     double y_min = series[0].samples[0];
     double y_max = y_min;
-    for (const Series& item : series) {
+    bool any_critical = false;
+    for (const HistorySeries& item : series) {
         for (double sample : item.samples) {
             y_min = std::min(y_min, sample);
             y_max = std::max(y_max, sample);
         }
         if (item.have_critical) {
+            any_critical = true;
             y_max = std::max(y_max, item.critical);
         }
     }
-    if (y_max - y_min < 8) {
-        const double mid = (y_max + y_min) / 2;
-        y_min = mid - 4;
-        y_max = mid + 4;
+    if (y_max - y_min < min_span) {
+        const double mid = (y_max + y_min) / 2.0;
+        y_min = mid - min_span / 2.0;
+        y_max = mid + min_span / 2.0;
     }
-    const double pad = (y_max - y_min) * 0.06;
+    const double pad = std::max((y_max - y_min) * 0.08, min_span * 0.05);
     y_min -= pad;
     y_max += pad;
+    if (y_max <= y_min) {
+        y_max = y_min + 1;
+    }
 
-    const int rows = 12;
-    const int axis = 6;
+    int axis = 6;
+    axis = std::max(axis, utf8_cols(format_axis_value(y_min)) + 2);
+    axis = std::max(axis, utf8_cols(format_axis_value(y_max)) + 2);
     const int label_w = 16;
     int cols = style.width - axis - 1 - label_w;
     if (cols < 20) {
         cols = std::max(16, style.width - axis);
     }
+
+    bool rounds_unique = true;
+    int round_lo = 0;
+    int round_hi = 0;
+    bool have_round = false;
+    for (const HistorySeries& item : series) {
+        for (size_t i = 0; i < item.rounds.size(); ++i) {
+            if (i > 0 && item.rounds[i] == item.rounds[i - 1]) {
+                rounds_unique = false;
+            }
+            if (!have_round || item.rounds[i] < round_lo) {
+                round_lo = item.rounds[i];
+            }
+            if (!have_round || item.rounds[i] > round_hi) {
+                round_hi = item.rounds[i];
+            }
+            have_round = true;
+        }
+    }
+
     struct Cell {
         int series = -1;
         std::string glyph;
     };
     std::vector<std::vector<Cell>> grid(static_cast<size_t>(rows), std::vector<Cell>(static_cast<size_t>(cols)));
-    auto y_of = [&](double celsius) {
-        double t = (celsius - y_min) / (y_max - y_min);
+    auto y_of = [&](double value) {
+        double t = (value - y_min) / (y_max - y_min);
         if (t < 0) {
             t = 0;
         }
@@ -1288,11 +1292,17 @@ void print_temperature_history(const Style& style, const Report& report) {
         }
         return y;
     };
-    auto x_of = [&](int index, int count) {
-        if (count <= 1 || cols <= 1) {
+    auto x_of = [&](int index, int count, int round) {
+        if (cols <= 1) {
             return 0;
         }
-        int x = static_cast<int>(std::lround(index * (cols - 1.0) / (count - 1)));
+        double t = 0;
+        if (rounds_unique && round_hi > round_lo) {
+            t = static_cast<double>(round - round_lo) / static_cast<double>(round_hi - round_lo);
+        } else if (count > 1) {
+            t = static_cast<double>(index) / static_cast<double>(count - 1);
+        }
+        int x = static_cast<int>(std::lround(t * (cols - 1)));
         if (x < 0) {
             x = 0;
         }
@@ -1315,16 +1325,15 @@ void print_temperature_history(const Style& style, const Report& report) {
         }
     };
 
-    const char* palette[] = {kCyan, kYellow, kMagenta, kGreen};
     std::vector<int> end_row(series.size(), -1);
     for (size_t s = 0; s < series.size(); ++s) {
-        const Series& item = series[s];
+        const HistorySeries& item = series[s];
         const int count = static_cast<int>(item.samples.size());
-        int prev_c = x_of(0, count);
+        int prev_c = x_of(0, count, item.rounds.empty() ? 0 : item.rounds[0]);
         int prev_r = y_of(item.samples[0]);
         place(prev_r, prev_c, static_cast<int>(s), "─");
         for (int i = 1; i < count; ++i) {
-            const int next_c = x_of(i, count);
+            const int next_c = x_of(i, count, item.rounds[static_cast<size_t>(i)]);
             const int next_r = y_of(item.samples[static_cast<size_t>(i)]);
             const int c0 = prev_c;
             const int r0 = prev_r;
@@ -1362,7 +1371,7 @@ void print_temperature_history(const Style& style, const Report& report) {
         std::string name;
     };
     std::vector<std::vector<CritMark>> crits(static_cast<size_t>(rows));
-    for (const Series& item : series) {
+    for (const HistorySeries& item : series) {
         if (!item.have_critical) {
             continue;
         }
@@ -1372,7 +1381,7 @@ void print_temperature_history(const Style& style, const Report& report) {
         crits[static_cast<size_t>(y_of(item.critical))].push_back(mark);
     }
 
-    std::cout << style.paint("  temperature", kBold) << style.paint("   start to finish", kDim) << "\n";
+    std::cout << style.paint(std::string("  ") + title, kBold) << style.paint(std::string("   ") + subtitle, kDim) << "\n";
     for (int row = 0; row < rows; ++row) {
         const bool has_crit = !crits[static_cast<size_t>(row)].empty();
         const bool label_row = row == 0 || row == rows - 1 || has_crit;
@@ -1386,16 +1395,14 @@ void print_temperature_history(const Style& style, const Report& report) {
             } else if (row == rows - 1) {
                 shown = y_min;
             }
-            char buf[16];
-            std::snprintf(buf, sizeof buf, "%3.0f", shown);
-            axis_text = buf;
+            axis_text = format_axis_value(shown);
         }
         axis_text = pad_left(axis_text, axis - 2);
         std::cout << style.paint(axis_text + (label_row ? " ┤" : " │"), kDim);
         for (int col = 0; col < cols; ++col) {
             const Cell& cell = grid[static_cast<size_t>(row)][static_cast<size_t>(col)];
             if (cell.series >= 0) {
-                std::cout << style.paint(cell.glyph, palette[cell.series % 4]);
+                std::cout << style.paint(cell.glyph, series[static_cast<size_t>(cell.series)].color);
             } else if (cell.series == -2) {
                 std::cout << style.paint(cell.glyph, kBold);
             } else if (has_crit) {
@@ -1414,20 +1421,24 @@ void print_temperature_history(const Style& style, const Report& report) {
             }
             std::cout << " " << style.paint(fit(note, label_w), kDimRed);
         } else {
-            std::string note;
             std::string shown;
+            int used = axis + cols + 1;
             for (size_t s = 0; s < series.size(); ++s) {
                 if (end_row[s] != row) {
                     continue;
                 }
-                if (!note.empty()) {
-                    note += " ";
+                const int gap = shown.empty() ? 0 : 1;
+                const int need = gap + utf8_cols(series[s].name);
+                if (used + need > style.width) {
+                    break;
+                }
+                if (gap != 0) {
                     shown += " ";
                 }
-                note += series[s].name;
-                shown += style.paint(series[s].name, palette[s % 4]);
+                shown += style.paint(series[s].name, series[s].color);
+                used += need;
             }
-            if (!note.empty()) {
+            if (!shown.empty()) {
                 std::cout << " " << shown;
             }
         }
@@ -1436,41 +1447,196 @@ void print_temperature_history(const Style& style, const Report& report) {
     std::cout << style.paint(std::string(static_cast<size_t>(axis - 2), ' ') + " └" + repeat_cols("─", cols), kDim) << "\n";
 
     std::string ticks(static_cast<size_t>(cols), ' ');
-    if (!series.empty()) {
-        const Series& item = series[0];
-        int last_round = -1;
-        const int count = static_cast<int>(item.samples.size());
-        for (size_t i = 0; i < item.rounds.size(); ++i) {
-            if (item.rounds[i] == last_round) {
-                continue;
+    const HistorySeries& ticks_from = series[0];
+    int last_round = -1;
+    const int tick_count = static_cast<int>(ticks_from.samples.size());
+    for (size_t i = 0; i < ticks_from.rounds.size(); ++i) {
+        if (ticks_from.rounds[i] == last_round) {
+            continue;
+        }
+        last_round = ticks_from.rounds[i];
+        int col = x_of(static_cast<int>(i), tick_count, last_round);
+        const std::string num = std::to_string(last_round);
+        if (col < 0 || col >= cols) {
+            continue;
+        }
+        if (col + static_cast<int>(num.size()) > cols) {
+            col = cols - static_cast<int>(num.size());
+        }
+        bool free = true;
+        for (size_t k = 0; k < num.size(); ++k) {
+            if (ticks[static_cast<size_t>(col + static_cast<int>(k))] != ' ') {
+                free = false;
             }
-            last_round = item.rounds[i];
-            const int col = x_of(static_cast<int>(i), count);
-            const std::string num = std::to_string(last_round);
-            if (col < 0 || col >= cols || col + static_cast<int>(num.size()) > cols) {
-                continue;
-            }
-            bool free = true;
-            for (size_t k = 0; k < num.size(); ++k) {
-                if (ticks[static_cast<size_t>(col + static_cast<int>(k))] != ' ') {
-                    free = false;
-                }
-            }
-            if (!free) {
-                continue;
-            }
-            for (size_t k = 0; k < num.size(); ++k) {
-                ticks[static_cast<size_t>(col + static_cast<int>(k))] = num[k];
-            }
+        }
+        if (!free) {
+            continue;
+        }
+        for (size_t k = 0; k < num.size(); ++k) {
+            ticks[static_cast<size_t>(col + static_cast<int>(k))] = num[k];
         }
     }
     std::cout << std::string(static_cast<size_t>(axis), ' ') << style.paint(ticks, kDim) << "\n";
 
     std::cout << std::string(static_cast<size_t>(axis), ' ');
-    for (size_t s = 0; s < series.size(); ++s) {
-        std::cout << style.paint("── ", palette[s % 4]) << series[s].name << "   ";
+    for (const HistorySeries& item : series) {
+        std::cout << style.paint("── ", item.color) << item.name << "   ";
     }
-    std::cout << style.paint("┈┈ ", kDimRed) << "critical\n\n";
+    if (any_critical) {
+        std::cout << style.paint("┈┈ ", kDimRed) << "critical";
+    }
+    std::cout << "\n\n";
+}
+
+// Draw each sensor from the first sample of the run to the last.
+// The horizontal axis is round order. Critical limits are dashed lines.
+void print_temperature_history(const Style& style, const Report& report) {
+    std::vector<HistorySeries> series;
+    const char* palette[] = {kCyan, kYellow, kMagenta, kGreen};
+    auto find_series = [&series](const std::string& name) -> HistorySeries* {
+        for (HistorySeries& item : series) {
+            if (item.name == name) {
+                return &item;
+            }
+        }
+        return nullptr;
+    };
+    for (const Round& round : report.tests) {
+        for (const TempSensor& sensor : round.temperature) {
+            HistorySeries* dest = find_series(sensor.name);
+            if (dest == nullptr) {
+                series.push_back(HistorySeries{});
+                dest = &series.back();
+                dest->name = sensor.name;
+                dest->color = palette[(series.size() - 1) % 4];
+            }
+            if (sensor.have_critical) {
+                dest->have_critical = true;
+                dest->critical = static_cast<double>(sensor.critical_mc) / 1000.0;
+            }
+            if (sensor.have_before) {
+                dest->samples.push_back(static_cast<double>(sensor.before_mc) / 1000.0);
+                dest->rounds.push_back(round.round);
+            }
+            if (sensor.have_after) {
+                dest->samples.push_back(static_cast<double>(sensor.after_mc) / 1000.0);
+                dest->rounds.push_back(round.round);
+            }
+        }
+    }
+    series.erase(std::remove_if(series.begin(),
+                                series.end(),
+                                [](const HistorySeries& item) { return item.samples.size() < 2; }),
+                 series.end());
+    draw_history(style, "temperature", "start to finish", series, 12, 8);
+}
+
+std::string align_right(std::string text, int width) {
+    const int n = utf8_cols(text);
+    if (n < width) {
+        text.insert(0, static_cast<size_t>(width - n), ' ');
+    }
+    return text;
+}
+
+// O for pass, X for fail. Columns stay intact when the table wraps.
+void print_result_table(const Style& style, const Report& report) {
+    if (report.tests.empty()) {
+        return;
+    }
+    int max_round = 1;
+    for (const Round& round : report.tests) {
+        max_round = std::max(max_round, std::max(1, round.round));
+    }
+    int digits = 1;
+    for (int value = max_round; value >= 10; value /= 10) {
+        ++digits;
+    }
+    const int cell = std::max(2, digits);
+    const int gap = 1;
+    const int label_w = 6;
+    const int avail = std::max(cell, style.width - label_w - 1);
+    const int per_row = std::max(1, avail / (cell + gap));
+
+    auto mark_of = [](bool pass) { return pass ? "O" : "X"; };
+    auto host_pass = [](const Round& round) {
+        if (round.host.present) {
+            return true;
+        }
+        return round.result == "pass";
+    };
+    auto vram_pass = [](const Round& round) {
+        if (round.vram.present) {
+            return true;
+        }
+        return round.result == "pass";
+    };
+
+    std::cout << style.paint("  results", kBold) << "\n";
+    for (size_t begin = 0; begin < report.tests.size(); begin += static_cast<size_t>(per_row)) {
+        const size_t end = std::min(report.tests.size(), begin + static_cast<size_t>(per_row));
+        if (begin > 0) {
+            std::cout << "\n";
+        }
+        auto print_row = [&](const std::string& label, const auto& value_of) {
+            std::cout << style.paint(pad_right(label, label_w), kDim);
+            for (size_t i = begin; i < end; ++i) {
+                std::cout << " ";
+                const std::string text = value_of(report.tests[i]);
+                const bool pass = text == "O";
+                const bool fail = text == "X";
+                const char* color = pass ? kGreen : (fail ? kRed : kDim);
+                std::cout << style.paint(align_right(text, cell), color);
+            }
+            std::cout << "\n";
+        };
+        print_row("", [](const Round& round) { return std::to_string(round.round); });
+        print_row("host", [&](const Round& round) { return std::string(mark_of(host_pass(round))); });
+        print_row("vram", [&](const Round& round) { return std::string(mark_of(vram_pass(round))); });
+        print_row("round", [](const Round& round) { return std::string(round.result == "pass" ? "O" : "X"); });
+    }
+    std::cout << "\n";
+}
+
+void print_bandwidth_history(const Style& style, const Report& report) {
+    HistorySeries h2d{"host → vram", {}, {}, kCyan};
+    HistorySeries d2h{"vram → host", {}, {}, kGreen};
+    HistorySeries check{"readback", {}, {}, kYellow};
+    HistorySeries d2d{"vram → vram", {}, {}, kMagenta};
+    for (const Round& round : report.tests) {
+        if (round.host.present) {
+            h2d.samples.push_back(round.host.h2d);
+            h2d.rounds.push_back(round.round);
+            d2h.samples.push_back(round.host.d2h);
+            d2h.rounds.push_back(round.round);
+        }
+        if (round.vram.present) {
+            d2d.samples.push_back(round.vram.d2d);
+            d2d.rounds.push_back(round.round);
+            check.samples.push_back(round.vram.check);
+            check.rounds.push_back(round.round);
+        }
+    }
+    std::vector<HistorySeries> host;
+    if (h2d.samples.size() >= 2) {
+        host.push_back(std::move(h2d));
+    }
+    if (d2h.samples.size() >= 2) {
+        host.push_back(std::move(d2h));
+    }
+    if (check.samples.size() >= 2) {
+        host.push_back(std::move(check));
+    }
+    std::vector<HistorySeries> device;
+    if (d2d.samples.size() >= 2) {
+        device.push_back(std::move(d2d));
+    }
+    if (!host.empty()) {
+        draw_history(style, "host bandwidth", "GiB/s", host, 8, 0.6);
+    }
+    if (!device.empty()) {
+        draw_history(style, "VRAM bandwidth", "GiB/s", device, 8, 8);
+    }
 }
 
 void render(const Style& style, const Report& report) {
@@ -1569,8 +1735,6 @@ void render(const Style& style, const Report& report) {
     rule(style, "└", "┘");
     std::cout << "\n";
 
-    print_temperature_history(style, report);
-
     const double host_steps[] = {2, 4, 8, 16, 32, 64};
     const double vram_steps[] = {64, 128, 256, 512, 1024, 2048};
     std::vector<Sample> h2d, d2h, d2d, check;
@@ -1661,6 +1825,10 @@ void render(const Style& style, const Report& report) {
         }
         rule(style, "└", "┘");
     }
+    std::cout << "\n";
+    print_bandwidth_history(style, report);
+    print_temperature_history(style, report);
+    print_result_table(style, report);
 }
 
 std::string read_stream(std::istream& in) {

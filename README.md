@@ -33,7 +33,7 @@ Each run also writes `vram-test-YYYYMMDD-HHMMSS.json` in the current directory. 
 
 ## View a log
 
-`vram-view` prints one JSON log as a terminal report: device and memory, a bar chart of host and VRAM bandwidth, one meter per copy, and the GPU temperature sensors. A line chart plots each sensor from the start of the run to the end. The horizontal axis is the round number, and a dashed line marks critical. On each temperature meter, `┃` is critical and the right end is emergency. A reading past emergency extends the meter past that mark. Temperature does not change pass or fail.
+`vram-view` prints one JSON log as a terminal report: device and memory, a bar chart of host and VRAM bandwidth, one meter per copy, and the GPU temperature sensors. At the end of the report, line charts plot host bandwidth (`host → vram`, `vram → host`, and readback), VRAM copy bandwidth, and each temperature sensor across the rounds. A dashed line marks critical on the temperature chart. The last block is an O/X table for the host check, the VRAM check, and the round. It wraps by whole columns. On each temperature meter, `┃` is critical and the right end is emergency. A reading past emergency extends the meter past that mark. Temperature does not change pass or fail.
 
 ```bash
 make view                        # newest vram-test-*.json

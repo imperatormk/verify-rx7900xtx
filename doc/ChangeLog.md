@@ -4,6 +4,21 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 18:10:14 — List every round as an O/X table
+
+- The last block of `vram-view` is a table of host, VRAM, and round results
+- `O` is pass and `X` is fail. The table wraps between columns so a round is not split
+
+## 2026-10-21 18:03:18 — Plot bandwidth across the rounds
+
+- `vram-view` draws host bandwidth and VRAM copy bandwidth as line charts at the end of the report, before the temperature chart
+- Host rates share one scale. The VRAM copy rate uses its own scale
+- The horizontal axis is the round number
+
+## 2026-10-21 17:58:28 — Show the temperature chart at the end of the report
+
+- `vram-view` prints the temperature line chart after the bandwidth summary and the per-round meters
+
 ## 2026-10-21 16:40:55 — Plot temperature from the start of the run to the end
 
 - `vram-view` draws one line per sensor through the before and after sample of every round
