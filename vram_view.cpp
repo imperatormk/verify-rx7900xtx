@@ -727,6 +727,7 @@ constexpr const char* kGreen = "\033[32m";
 constexpr const char* kYellow = "\033[33m";
 constexpr const char* kMagenta = "\033[35m";
 constexpr const char* kCyan = "\033[36m";
+constexpr const char* kDimRed = "\033[2;31m";
 
 std::string repeat_cols(const std::string& unit, int count) {
     std::string out;
@@ -1192,6 +1193,286 @@ void print_temperatures(const Style& style, const std::vector<TempSensor>& senso
     std::cout << "\n";
 }
 
+// Draw each sensor from the first sample of the run to the last.
+// The horizontal axis is round order. Critical limits are dashed lines.
+void print_temperature_history(const Style& style, const Report& report) {
+    struct Series {
+        std::string name;
+        std::vector<double> samples;
+        std::vector<int> rounds;
+        bool have_critical = false;
+        double critical = 0;
+    };
+    std::vector<Series> series;
+    auto find_series = [&series](const std::string& name) -> Series* {
+        for (Series& item : series) {
+            if (item.name == name) {
+                return &item;
+            }
+        }
+        return nullptr;
+    };
+    for (const Round& round : report.tests) {
+        for (const TempSensor& sensor : round.temperature) {
+            Series* dest = find_series(sensor.name);
+            if (dest == nullptr) {
+                series.push_back(Series{});
+                dest = &series.back();
+                dest->name = sensor.name;
+            }
+            if (sensor.have_critical) {
+                dest->have_critical = true;
+                dest->critical = static_cast<double>(sensor.critical_mc) / 1000.0;
+            }
+            if (sensor.have_before) {
+                dest->samples.push_back(static_cast<double>(sensor.before_mc) / 1000.0);
+                dest->rounds.push_back(round.round);
+            }
+            if (sensor.have_after) {
+                dest->samples.push_back(static_cast<double>(sensor.after_mc) / 1000.0);
+                dest->rounds.push_back(round.round);
+            }
+        }
+    }
+    series.erase(std::remove_if(series.begin(), series.end(), [](const Series& item) { return item.samples.size() < 2; }), series.end());
+    if (series.empty()) {
+        return;
+    }
+
+    double y_min = series[0].samples[0];
+    double y_max = y_min;
+    for (const Series& item : series) {
+        for (double sample : item.samples) {
+            y_min = std::min(y_min, sample);
+            y_max = std::max(y_max, sample);
+        }
+        if (item.have_critical) {
+            y_max = std::max(y_max, item.critical);
+        }
+    }
+    if (y_max - y_min < 8) {
+        const double mid = (y_max + y_min) / 2;
+        y_min = mid - 4;
+        y_max = mid + 4;
+    }
+    const double pad = (y_max - y_min) * 0.06;
+    y_min -= pad;
+    y_max += pad;
+
+    const int rows = 12;
+    const int axis = 6;
+    const int label_w = 16;
+    int cols = style.width - axis - 1 - label_w;
+    if (cols < 20) {
+        cols = std::max(16, style.width - axis);
+    }
+    struct Cell {
+        int series = -1;
+        std::string glyph;
+    };
+    std::vector<std::vector<Cell>> grid(static_cast<size_t>(rows), std::vector<Cell>(static_cast<size_t>(cols)));
+    auto y_of = [&](double celsius) {
+        double t = (celsius - y_min) / (y_max - y_min);
+        if (t < 0) {
+            t = 0;
+        }
+        if (t > 1) {
+            t = 1;
+        }
+        int y = static_cast<int>(std::lround((1.0 - t) * (rows - 1)));
+        if (y < 0) {
+            y = 0;
+        }
+        if (y >= rows) {
+            y = rows - 1;
+        }
+        return y;
+    };
+    auto x_of = [&](int index, int count) {
+        if (count <= 1 || cols <= 1) {
+            return 0;
+        }
+        int x = static_cast<int>(std::lround(index * (cols - 1.0) / (count - 1)));
+        if (x < 0) {
+            x = 0;
+        }
+        if (x >= cols) {
+            x = cols - 1;
+        }
+        return x;
+    };
+    auto place = [&](int row, int col, int series_index, const std::string& glyph) {
+        if (row < 0 || col < 0 || row >= rows || col >= cols) {
+            return;
+        }
+        Cell& cell = grid[static_cast<size_t>(row)][static_cast<size_t>(col)];
+        if (cell.series < 0) {
+            cell.series = series_index;
+            cell.glyph = glyph;
+        } else if (cell.series != series_index) {
+            cell.series = -2;
+            cell.glyph = "●";
+        }
+    };
+
+    const char* palette[] = {kCyan, kYellow, kMagenta, kGreen};
+    std::vector<int> end_row(series.size(), -1);
+    for (size_t s = 0; s < series.size(); ++s) {
+        const Series& item = series[s];
+        const int count = static_cast<int>(item.samples.size());
+        int prev_c = x_of(0, count);
+        int prev_r = y_of(item.samples[0]);
+        place(prev_r, prev_c, static_cast<int>(s), "─");
+        for (int i = 1; i < count; ++i) {
+            const int next_c = x_of(i, count);
+            const int next_r = y_of(item.samples[static_cast<size_t>(i)]);
+            const int c0 = prev_c;
+            const int r0 = prev_r;
+            const int span = std::max(1, next_c - c0);
+            for (int step = 1; step <= span; ++step) {
+                const int col = c0 + (next_c - c0) * step / span;
+                const int row = r0 + (next_r - r0) * step / span;
+                if (col == prev_c && row == prev_r) {
+                    continue;
+                }
+                std::string glyph = "─";
+                if (row < prev_r) {
+                    place(prev_r, col, static_cast<int>(s), "╯");
+                    for (int mid = prev_r - 1; mid > row; --mid) {
+                        place(mid, col, static_cast<int>(s), "│");
+                    }
+                    glyph = "╰";
+                } else if (row > prev_r) {
+                    place(prev_r, col, static_cast<int>(s), "╮");
+                    for (int mid = prev_r + 1; mid < row; ++mid) {
+                        place(mid, col, static_cast<int>(s), "│");
+                    }
+                    glyph = "╭";
+                }
+                place(row, col, static_cast<int>(s), glyph);
+                prev_r = row;
+                prev_c = col;
+            }
+        }
+        end_row[s] = prev_r;
+    }
+
+    struct CritMark {
+        double value = 0;
+        std::string name;
+    };
+    std::vector<std::vector<CritMark>> crits(static_cast<size_t>(rows));
+    for (const Series& item : series) {
+        if (!item.have_critical) {
+            continue;
+        }
+        CritMark mark;
+        mark.value = item.critical;
+        mark.name = item.name;
+        crits[static_cast<size_t>(y_of(item.critical))].push_back(mark);
+    }
+
+    std::cout << style.paint("  temperature", kBold) << style.paint("   start to finish", kDim) << "\n";
+    for (int row = 0; row < rows; ++row) {
+        const bool has_crit = !crits[static_cast<size_t>(row)].empty();
+        const bool label_row = row == 0 || row == rows - 1 || has_crit;
+        std::string axis_text;
+        if (label_row) {
+            double shown = y_min + (1.0 - static_cast<double>(row) / (rows - 1)) * (y_max - y_min);
+            if (has_crit) {
+                shown = crits[static_cast<size_t>(row)][0].value;
+            } else if (row == 0) {
+                shown = y_max;
+            } else if (row == rows - 1) {
+                shown = y_min;
+            }
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "%3.0f", shown);
+            axis_text = buf;
+        }
+        axis_text = pad_left(axis_text, axis - 2);
+        std::cout << style.paint(axis_text + (label_row ? " ┤" : " │"), kDim);
+        for (int col = 0; col < cols; ++col) {
+            const Cell& cell = grid[static_cast<size_t>(row)][static_cast<size_t>(col)];
+            if (cell.series >= 0) {
+                std::cout << style.paint(cell.glyph, palette[cell.series % 4]);
+            } else if (cell.series == -2) {
+                std::cout << style.paint(cell.glyph, kBold);
+            } else if (has_crit) {
+                std::cout << style.paint("┈", kDimRed);
+            } else {
+                std::cout << " ";
+            }
+        }
+        if (has_crit) {
+            std::string note;
+            for (const CritMark& mark : crits[static_cast<size_t>(row)]) {
+                if (!note.empty()) {
+                    note += ", ";
+                }
+                note += mark.name;
+            }
+            std::cout << " " << style.paint(fit(note, label_w), kDimRed);
+        } else {
+            std::string note;
+            std::string shown;
+            for (size_t s = 0; s < series.size(); ++s) {
+                if (end_row[s] != row) {
+                    continue;
+                }
+                if (!note.empty()) {
+                    note += " ";
+                    shown += " ";
+                }
+                note += series[s].name;
+                shown += style.paint(series[s].name, palette[s % 4]);
+            }
+            if (!note.empty()) {
+                std::cout << " " << shown;
+            }
+        }
+        std::cout << "\n";
+    }
+    std::cout << style.paint(std::string(static_cast<size_t>(axis - 2), ' ') + " └" + repeat_cols("─", cols), kDim) << "\n";
+
+    std::string ticks(static_cast<size_t>(cols), ' ');
+    if (!series.empty()) {
+        const Series& item = series[0];
+        int last_round = -1;
+        const int count = static_cast<int>(item.samples.size());
+        for (size_t i = 0; i < item.rounds.size(); ++i) {
+            if (item.rounds[i] == last_round) {
+                continue;
+            }
+            last_round = item.rounds[i];
+            const int col = x_of(static_cast<int>(i), count);
+            const std::string num = std::to_string(last_round);
+            if (col < 0 || col >= cols || col + static_cast<int>(num.size()) > cols) {
+                continue;
+            }
+            bool free = true;
+            for (size_t k = 0; k < num.size(); ++k) {
+                if (ticks[static_cast<size_t>(col + static_cast<int>(k))] != ' ') {
+                    free = false;
+                }
+            }
+            if (!free) {
+                continue;
+            }
+            for (size_t k = 0; k < num.size(); ++k) {
+                ticks[static_cast<size_t>(col + static_cast<int>(k))] = num[k];
+            }
+        }
+    }
+    std::cout << std::string(static_cast<size_t>(axis), ' ') << style.paint(ticks, kDim) << "\n";
+
+    std::cout << std::string(static_cast<size_t>(axis), ' ');
+    for (size_t s = 0; s < series.size(); ++s) {
+        std::cout << style.paint("── ", palette[s % 4]) << series[s].name << "   ";
+    }
+    std::cout << style.paint("┈┈ ", kDimRed) << "critical\n\n";
+}
+
 void render(const Style& style, const Report& report) {
     const std::string word = status_word(report);
     const char* sc = status_color(report);
@@ -1287,6 +1568,8 @@ void render(const Style& style, const Report& report) {
     }
     rule(style, "└", "┘");
     std::cout << "\n";
+
+    print_temperature_history(style, report);
 
     const double host_steps[] = {2, 4, 8, 16, 32, 64};
     const double vram_steps[] = {64, 128, 256, 512, 1024, 2048};

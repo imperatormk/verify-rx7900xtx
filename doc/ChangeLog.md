@@ -4,6 +4,12 @@
 >   This document is the change history. Timestamps come from the `date` command, in `YYYY-MM-DD HH:MM:SS` form.
 >   Newest entries are listed first.
 
+## 2026-10-21 16:40:55 — Plot temperature from the start of the run to the end
+
+- `vram-view` draws one line per sensor through the before and after sample of every round
+- The horizontal axis is the round number. Dashed lines mark critical
+- A log with no temperature samples omits the chart
+
 ## 2026-10-21 16:12:49 — Record GPU temperatures and show the thresholds
 
 - Each round records edge, junction, and mem at the start and after the copies, in millidegrees Celsius, with critical and emergency limits
